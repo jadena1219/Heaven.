@@ -1984,7 +1984,7 @@ function showHint(text){
   hintEl.classList.add('show');
   hintTimer = 6;
 }
-const TOUR_HINT = 'cinematic tour — C to fly free · click an isle to behold it · E to enter the gate · H for help';
+const TOUR_HINT = 'cinematic tour — C to fly free · click an isle to behold it · E to enter the gate · M sound · H help';
 let FLY_HINT = 'free flight — click to look · WASD move · Space up · Q down · Shift fast · C to return';
 /* where the browser can tell us, name the keys as they appear on the user's
    actual layout (the code reads physical positions, so WASD is wrong text
@@ -2016,9 +2016,11 @@ function setFly(on){
   }
 }
 addEventListener('keydown', (e) => {
+  if (e.code !== 'KeyM') ensureAudio();   // any gesture wakes the sound; M manages it itself
   if (e.code === 'KeyC' && !e.repeat && !portalSeq.on) setFly(!fly.on);
   if (e.code === 'KeyE' && !e.repeat && !portalSeq.on) startPortal();
   if (e.code === 'KeyH' && !e.repeat) showHint(fly.on ? FLY_HINT : TOUR_HINT);
+  if (e.code === 'KeyM' && !e.repeat) audioToggle();
   if (e.code === 'Escape' && portalSeq.on) abortPortal();
   fly.keys[e.code] = true;
 });
@@ -2036,6 +2038,7 @@ document.addEventListener('pointerlockerror', () => {
   if (fly.on) showHint('mouse capture blocked — drag to look, or click again in a moment');
 });
 renderer.domElement.addEventListener('pointerdown', (e) => {
+  ensureAudio();
   if (e.button !== 0) return;
   if (!fly.on){
     /* on the tour: clicks reach into the world — isles and the gate answer */
@@ -2091,6 +2094,7 @@ function actOn(obj){
       const g = obj.userData.islandGroup;
       /* begin the orbit from the camera's present bearing — no swing-around */
       focus.angle = Math.atan2(camera.position.x - g.position.x, camera.position.z - g.position.z);
+      audioChime();
       showHint('beholding the isle — click it again, or the open sky, to drift on');
     }
   }
@@ -2103,10 +2107,12 @@ function startPortal(){
   focus.island = null;
   fly.on = false;
   if (document.pointerLockElement) document.exitPointerLock();
+  audioPortal(true);
   showHint('the Source calls…');
 }
 function abortPortal(){
   portalSeq.on = false;
+  audioPortal(false);
   gradeUniforms.uFlash.value = 0;
   const pu = gate.userData;
   pu.portal.material.opacity = 0.6;
@@ -2147,6 +2153,7 @@ function updatePortalSeq(dt){
     pu.portalCore.material.opacity = 0.9;
     pu.portalCore.scale.setScalar(170);
     window.__heaven.setTour(0.001);
+    audioPortal(false);
     showHint('…and the isles receive you again');
   }
 }
@@ -2252,6 +2259,247 @@ function updateCamera(t, dt){
   camera.lookAt(lookSmooth);
 }
 
+/* ============================================================
+   12.7 The sound of Heaven — a constant glowing drone.
+   Faint opera heard through light: synthesized "ahh" choir voices on open
+   fifths that never resolve into tension, breathing in slow swells inside a
+   cathedral of reverb, with high shimmer-air above, wind that rises when you
+   fly, waterfall sparkle that grows as you near the falls, a soft bell when
+   you behold an isle, and a rising radiance through the portal. Everything
+   procedural — zero assets — and everything FAINT. M to hush it.
+   ============================================================ */
+const audio = { on: false, muted: false, ctx: null, master: null, choirGain: null,
+                windGain: null, windSpeed: 0, fallGain: null, analyser: null,
+                voices: [], chord: 0, chordTimer: 0, portalV: null };
+const aRng = mulberry32(777);
+const AR = () => aRng();
+
+/* consonant progression over a D pedal — degrees in semitones from D3.
+   Voice-led: each voice glides to its column's next value, nothing jumps. */
+const CHORDS = [
+  [-12, 0, 7, 12, 21],    // D  pedal · D A D' A''-3 (open, home)
+  [-12, 0, 9, 16, 21],    // B minor-ish glow over the pedal
+  [-12, -3, 5, 12, 19],   // G major color, still rooted
+  [-12, 0, 7, 14, 23],    // D with a lifted 9th — hope, not tension
+];
+const D3 = 146.83;
+const semi = n => D3 * Math.pow(2, n / 12);
+
+function makeNoiseBuffer(ctx, seconds){
+  const buf = ctx.createBuffer(2, (ctx.sampleRate * seconds) | 0, ctx.sampleRate);
+  for (let ch = 0; ch < 2; ch++){
+    const d = buf.getChannelData(ch);
+    for (let i = 0; i < d.length; i++) d[i] = AR() * 2 - 1;
+  }
+  return buf;
+}
+function makeCathedralIR(ctx){
+  /* decorrelated stereo noise under an exponential decay, softly lowpassed —
+     a 5-second stone nave, generated instead of downloaded */
+  const secs = 5, len = (ctx.sampleRate * secs) | 0;
+  const buf = ctx.createBuffer(2, len, ctx.sampleRate);
+  for (let ch = 0; ch < 2; ch++){
+    const d = buf.getChannelData(ch);
+    let lp = 0;
+    for (let i = 0; i < len; i++){
+      const t = i / len;
+      const k = 0.12 + 0.5 * t;                       // darkens as it dies away
+      lp += ((AR() * 2 - 1) - lp) * (1 - k);
+      d[i] = lp * Math.pow(1 - t, 2.2) * 0.5;
+    }
+  }
+  return buf;
+}
+function makeChoirVoice(ctx, dest, freq, level){
+  /* two detuned triangles through an "ahh" formant bank, with slow vibrato
+     and its own breathing LFO — one far-away singer */
+  const vg = ctx.createGain();
+  vg.gain.value = level;
+  const formants = [[760, 9, 1.0], [1180, 10, 0.42], [2850, 12, 0.14]];
+  const bank = formants.map(([f, q, g]) => {
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass'; bp.frequency.value = f * (0.94 + AR()*0.12); bp.Q.value = q;
+    const fg = ctx.createGain(); fg.gain.value = g;
+    bp.connect(fg).connect(vg);
+    return bp;
+  });
+  const oscs = [-3.5, 3.5].map(cents => {
+    const o = ctx.createOscillator();
+    o.type = 'triangle';
+    o.frequency.value = freq;
+    o.detune.value = cents;
+    for (const bp of bank) o.connect(bp);
+    return o;
+  });
+  /* vibrato — slow and shallow, an opera singer at the horizon */
+  const vib = ctx.createOscillator();
+  vib.frequency.value = 4.6 + AR()*1.2;
+  const vibG = ctx.createGain();
+  vibG.gain.value = 2.5 + AR()*2;                     // cents
+  vib.connect(vibG);
+  for (const o of oscs) vibG.connect(o.detune);
+  /* breath — each voice swells on its own slow tide */
+  const br = ctx.createOscillator();
+  br.frequency.value = 0.03 + AR()*0.05;
+  const brG = ctx.createGain();
+  brG.gain.value = level * 0.45;
+  br.connect(brG).connect(vg.gain);
+  vg.connect(dest);
+  for (const o of [...oscs, vib, br]) o.start();
+  return { oscs, gain: vg };
+}
+function ensureAudio(){
+  if (audio.on) return;
+  audio.on = true;
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  audio.ctx = ctx;
+  if (ctx.state === 'suspended') ctx.resume();
+
+  const comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = -26; comp.knee.value = 22; comp.ratio.value = 3;
+  comp.attack.value = 0.08; comp.release.value = 0.4;
+  audio.master = ctx.createGain();
+  audio.master.gain.value = 0;                        // faded in below
+  audio.analyser = ctx.createAnalyser();
+  audio.analyser.fftSize = 2048;
+  audio.master.connect(comp).connect(audio.analyser).connect(ctx.destination);
+
+  /* the nave: everything sings into the same stone */
+  const verb = ctx.createConvolver();
+  verb.buffer = makeCathedralIR(ctx);
+  const wet = ctx.createGain(); wet.gain.value = 0.62;
+  const dry = ctx.createGain(); dry.gain.value = 0.42;
+  verb.connect(wet).connect(audio.master);
+  dry.connect(audio.master);
+  const room = ctx.createGain();                      // sources feed this
+  room.connect(verb); room.connect(dry);
+
+  /* choir on the opening chord */
+  audio.choirGain = ctx.createGain();
+  audio.choirGain.gain.value = 1;
+  audio.choirGain.connect(room);
+  const levels = [0.120, 0.100, 0.086, 0.062, 0.034]; // low pedal loudest, top faintest
+  audio.voices = CHORDS[0].map((n, i) => makeChoirVoice(ctx, audio.choirGain, semi(n), levels[i]));
+
+  /* shimmer-air: the glow above the voices */
+  const noise = ctx.createBufferSource();
+  noise.buffer = makeNoiseBuffer(ctx, 4);
+  noise.loop = true;
+  const airHp = ctx.createBiquadFilter();
+  airHp.type = 'highpass'; airHp.frequency.value = 5800;
+  const airG = ctx.createGain(); airG.gain.value = 0.02;
+  noise.connect(airHp).connect(airG).connect(room);
+  noise.start();
+
+  /* wind: rises when you fly */
+  const wind = ctx.createBufferSource();
+  wind.buffer = makeNoiseBuffer(ctx, 6);
+  wind.loop = true;
+  const windBp = ctx.createBiquadFilter();
+  windBp.type = 'bandpass'; windBp.frequency.value = 480; windBp.Q.value = 0.6;
+  const windLfo = ctx.createOscillator(); windLfo.frequency.value = 0.07;
+  const windLfoG = ctx.createGain(); windLfoG.gain.value = 160;
+  windLfo.connect(windLfoG).connect(windBp.frequency); windLfo.start();
+  audio.windGain = ctx.createGain(); audio.windGain.gain.value = 0.028;
+  wind.connect(windBp).connect(audio.windGain).connect(room);
+  wind.start();
+
+  /* waterfall sparkle: gain driven by proximity every frame */
+  const falls = ctx.createBufferSource();
+  falls.buffer = makeNoiseBuffer(ctx, 5);
+  falls.loop = true;
+  const fallBp = ctx.createBiquadFilter();
+  fallBp.type = 'bandpass'; fallBp.frequency.value = 2900; fallBp.Q.value = 1.8;
+  audio.fallGain = ctx.createGain(); audio.fallGain.gain.value = 0;
+  falls.connect(fallBp).connect(audio.fallGain).connect(room);
+  falls.start();
+
+  /* the world fades in over six seconds — no downbeat, it was always there */
+  audio.master.gain.setTargetAtTime(0.75, ctx.currentTime + 0.1, 2.2);
+  audio.room = room;
+  showHint('the isles are singing — M to hush them');
+}
+function audioChime(){
+  /* a soft far bell for beholding an isle */
+  if (!audio.on || audio.muted) return;
+  const ctx = audio.ctx, t = ctx.currentTime;
+  for (const [ratio, g, tau] of [[1, 0.075, 1.6], [2.756, 0.027, 1.1], [5.404, 0.012, 0.7]]){
+    const o = ctx.createOscillator();
+    o.frequency.value = 587.33 * ratio * (1 + (AR() - 0.5) * 0.004);   // D5 partials
+    const og = ctx.createGain();
+    og.gain.setValueAtTime(0, t);
+    og.gain.linearRampToValueAtTime(g, t + 0.02);
+    og.gain.setTargetAtTime(0, t + 0.05, tau * 0.33);
+    o.connect(og).connect(audio.room);
+    o.start(t); o.stop(t + tau * 3);
+  }
+}
+function audioPortal(entering){
+  /* the choir swells and a single voice rises with you into the light */
+  if (!audio.on) return;
+  const ctx = audio.ctx, t = ctx.currentTime;
+  audio.choirGain.gain.cancelScheduledValues(t);
+  audio.choirGain.gain.setTargetAtTime(entering ? 1.9 : 1.0, t, entering ? 3.2 : 1.2);
+  if (entering){
+    const o = ctx.createOscillator();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(semi(12), t);
+    o.frequency.exponentialRampToValueAtTime(semi(24), t + 9);
+    const og = ctx.createGain();
+    og.gain.setValueAtTime(0, t);
+    og.gain.linearRampToValueAtTime(0.03, t + 5);
+    og.gain.setTargetAtTime(0, t + 9.5, 0.8);
+    o.connect(og).connect(audio.room);
+    o.start(t); o.stop(t + 13);
+    audio.portalV = o;
+  } else if (audio.portalV){
+    try { audio.portalV.stop(); } catch(e){}
+    audio.portalV = null;
+  }
+}
+function audioToggle(){
+  if (!audio.on){ ensureAudio(); return; }
+  audio.muted = !audio.muted;
+  const t = audio.ctx.currentTime;
+  audio.master.gain.cancelScheduledValues(t);
+  audio.master.gain.setTargetAtTime(audio.muted ? 0 : 0.75, t, 0.25);
+  showHint(audio.muted ? 'hushed — M to let the isles sing' : 'the isles are singing — M to hush them');
+}
+const _fallBase = new THREE.Vector3();
+function audioFrame(dt){
+  if (!audio.on || audio.muted) return;
+  /* chord drift: every ~28-40s glide each singer to the next chord tone */
+  audio.chordTimer -= dt;
+  if (audio.chordTimer <= 0){
+    audio.chordTimer = 28 + AR()*12;
+    audio.chord = (audio.chord + 1) % CHORDS.length;
+    const t = audio.ctx.currentTime;
+    CHORDS[audio.chord].forEach((n, i) => {
+      for (const o of audio.voices[i].oscs){
+        o.frequency.cancelScheduledValues(t);
+        o.frequency.setTargetAtTime(semi(n), t, 2.8);   // an eight-second lean, not a step
+      }
+    });
+  }
+  /* wind follows flight speed */
+  const speed = fly.on ? (_mv.lengthSq() > 0 || pad.move.lengthSq() > 0 ? 1 : 0.3) : 0.15;
+  audio.windSpeed += (speed - audio.windSpeed) * Math.min(1, dt*1.5);
+  audio.windGain.gain.value = 0.028 + audio.windSpeed * 0.045;
+  /* nearest waterfall base brightens the sparkle */
+  let nearest = 1e9;
+  for (const fi of fallInfos){
+    _fallBase.set(fi.top.x, MIST_Y + 8, fi.top.z);
+    nearest = Math.min(nearest, camera.position.distanceTo(_fallBase));
+    nearest = Math.min(nearest, camera.position.distanceTo(fi.top));
+  }
+  audio.fallGain.gain.value = 0.08 * Math.exp(-nearest / 170);
+}
+document.addEventListener('visibilitychange', () => {
+  if (!audio.on) return;
+  if (document.hidden) audio.ctx.suspend();
+  else audio.ctx.resume();
+});
+
 /* debug/screenshot hooks */
 const qp = new URLSearchParams(location.search);
 if (qp.has('t')){
@@ -2260,7 +2508,7 @@ if (qp.has('t')){
 }
 window.__heaven = {
   ready: false,
-  scene, gate, camera, renderer,   // debug/QA hooks
+  scene, gate, camera, renderer, audio,   // debug/QA hooks
   info: () => ({ calls: renderer.info.render.calls, tris: renderer.info.render.triangles,
                  geoms: renderer.info.memory.geometries, progs: renderer.info.programs.length }),
   setTour(tt){
@@ -2348,6 +2596,7 @@ function animate(){
   updateCamera(t, dt);
   camera.updateMatrixWorld();
   updateFlare(dt);
+  audioFrame(dt);
   /* after the portal: the world eases back in from the white */
   if (!portalSeq.on && gradeUniforms.uFlash.value > 0){
     gradeUniforms.uFlash.value = Math.max(0, gradeUniforms.uFlash.value - dt*0.5);

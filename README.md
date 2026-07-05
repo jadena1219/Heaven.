@@ -33,6 +33,7 @@ python3 -m http.server
 | `W A S D` | Move |
 | `Space` / `Q` | Rise / sink |
 | `Shift` | Fly fast |
+| `M` | Hush / wake the sound |
 | `H` | Re-show the help hint |
 | `Esc` | Release the mouse / abort the gate sequence |
 
@@ -49,6 +50,14 @@ python3 -m http.server
 | Options | Toggle free-fly |
 
 ## Notes
+
+- **The sound of Heaven** (starts on your first click or key press): a
+  constant glowing drone — synthesized "ahh" choir voices on open fifths,
+  gliding through consonant chords inside a procedurally generated cathedral
+  reverb, with shimmer-air above, wind that rises when you fly, waterfall
+  sparkle that grows as you approach the falls, a soft bell when you behold
+  an isle, and a swell of voices through the portal. Fully procedural
+  WebAudio — no audio files. `M` mutes.
 
 - **Adaptive quality, both ways**: a five-rung ladder (0.8×–2.0× render scale,
   MSAA 0–4×) steps down when frames sag past your display's own refresh
