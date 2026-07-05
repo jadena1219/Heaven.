@@ -96,8 +96,9 @@ const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'h
 renderer.setSize(innerWidth, innerHeight);
 let pixelLevel = 0;
 /* effective, deduplicated quality steps: on a dpr-1 display the first
-   step-down must actually lower resolution, not clamp to the same value */
-const PIXEL_STEPS = [...new Set([1.5, 1.15, 0.85].map(s => Math.min(devicePixelRatio || 1, s)))];
+   step-down must actually lower resolution, not clamp to the same value.
+   Base cap is 1.25 — MSAA carries edge quality instead of raw resolution */
+const PIXEL_STEPS = [...new Set([1.25, 1.0, 0.8].map(s => Math.min(devicePixelRatio || 1, s)))];
 renderer.setPixelRatio(Math.min(devicePixelRatio, PIXEL_STEPS[pixelLevel]));
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.0;
@@ -315,17 +316,18 @@ const skyMat = new THREE.ShaderMaterial({
       float disc = smoothstep(0.9962, 0.99905, sd);
       float glow = pow(sd, 20.0)*0.5 + pow(sd, 5.0)*0.16;
       col += vec3(1.0, 0.72, 0.42)*glow + vec3(1.0, 0.9, 0.72)*disc*2.2;
-      /* faint rose & champagne aurora, upper sky */
-      float az = atan(dir.z, dir.x);
-      float band = fbm(vec2(az*2.2 + uTime*0.016, dir.y*5.5 - uTime*0.011));
+      /* faint rose & champagne aurora, upper sky — sampled in a seam-free
+         projected domain (raw azimuth would leave a hard line at ±pi) */
+      vec2 sp = dir.xz / (1.0 + max(dir.y, 0.0));
+      float band = fbm(vec2((sp.x + sp.y*0.7)*6.0 + uTime*0.016, dir.y*5.5 - uTime*0.011));
       float aur = smoothstep(0.18, 0.6, h) * smoothstep(0.42, 0.78, band);
       vec3 aurCol = mix(vec3(0.9, 0.42, 0.42), vec3(0.95, 0.7, 0.4),
-                        vnoise(vec2(az*3.0, dir.y*4.0) + uTime*0.02));
+                        vnoise(sp*4.0 + uTime*0.02));
       col += aurCol * aur * 0.34;
       /* faint high cloud streaks */
-      col += vec3(0.9, 0.62, 0.36) * fbm(vec2(az*4.0 + uTime*0.004, dir.y*9.0)) * 0.07 * smoothstep(0.0, 0.35, h);
+      col += vec3(0.9, 0.62, 0.36) * fbm(vec2((sp.x - sp.y*0.6)*7.0 + uTime*0.004, dir.y*9.0)) * 0.07 * smoothstep(0.0, 0.35, h);
       /* dither to kill banding */
-      col += (hash12(gl_FragCoord.xy) - 0.5) * 0.008;
+      col += (hash12(gl_FragCoord.xy) - 0.5) * 0.004;
       gl_FragColor = vec4(col, 1.0);
     }
   `
@@ -382,7 +384,7 @@ function updateFlare(dt){
       if (flareCheck <= 0){   // occlusion ray is throttled — it can touch many triangles
         flareCheck = 0.12;
         flareRay.set(camera.position, _flarePos.copy(SUN_POS).sub(camera.position).normalize());
-        flareRay.far = 2000;
+        flareRay.far = 2600;   // covers the camera→gate distance from anywhere on the tour
         flareOccluded = flareRay.intersectObjects(occluders, false).length > 0;
       }
       if (flareOccluded) target = 0;
@@ -408,7 +410,7 @@ function updateFlare(dt){
 function buildGodRays(){
   const rayDir = SUN_DIR.clone().negate().normalize(); // from sun into scene
   const geoms = [];
-  const N = 13;
+  const N = 9;
   for (let i = 0; i < N; i++){
     const w = RR(50, 170), L = RR(1500, 2500);
     const g = new THREE.PlaneGeometry(w, L, 1, 1);
@@ -454,8 +456,9 @@ function buildGodRays(){
         float pulse = 0.55 + 0.45*sin(uTime*0.07 + vSeed*13.7);
         vec3 vDir = normalize(cameraPosition - vW);
         float face = abs(dot(normalize(vN), vDir));
-        float a = ex*ex * ey * (0.30 + 0.7*flow) * pulse * face * 0.07;
-        gl_FragColor = vec4(vec3(1.0, 0.78, 0.48) * a, a);
+        /* emit alpha once — AdditiveBlending already multiplies rgb by SrcAlpha */
+        float a = ex*ex * ey * (0.30 + 0.7*flow) * pulse * face * 0.055;
+        gl_FragColor = vec4(vec3(1.0, 0.78, 0.48), a);
       }
     `
   });
@@ -645,7 +648,7 @@ function crystalShader(yRange, glowMul, fogMix){
         vec3 vDir = normalize(cameraPosition - vW);
         float fres = pow(1.0 - abs(dot(normalize(vN), vDir)), 2.0);
         float pulse = 0.72 + 0.28 * sin(uTime*1.4 + vPh);
-        vec3 col = base * (0.55 + 0.45*pulse) + vec3(1.0, 0.86, 0.58) * fres * 2.3 * pulse * uGlow;
+        vec3 col = base * (0.55 + 0.45*pulse) + vec3(1.0, 0.86, 0.58) * fres * 1.7 * pulse * uGlow;
         float ff = fogFactor(distance(cameraPosition, vW), uFogDensity) * uFogMix;
         col = mix(col, uFogColor, ff);
         gl_FragColor = vec4(col, 1.0);
@@ -713,7 +716,7 @@ function buildTreeGeometry(seed){
 const treeGeo = buildTreeGeometry(7.7);
 
 /* --- grass / flower base geometry --------------------------- */
-const grassGeo = new THREE.PlaneGeometry(0.55, 2.7, 1, 2);
+const grassGeo = new THREE.PlaneGeometry(0.85, 2.7, 1, 2);   // wide blades alias less
 grassGeo.translate(0, 1.35, 0);
 const flowerGeo = new THREE.PlaneGeometry(1.5, 1.5);
 flowerGeo.translate(0, 0.75, 0);
@@ -752,13 +755,13 @@ const fallMat = new THREE.ShaderMaterial({
       float streak = fbm(vec2(vUv.x*13.0, vUv.y*2.1 - t*0.9));
       float foam   = smoothstep(0.56, 0.92, fbm(vec2(vUv.x*8.0 + 3.0, vUv.y*6.5 - t*2.1)));
       vec3 col = mix(vec3(1.0, 0.62, 0.2), vec3(1.0, 0.88, 0.6), streak);
-      col += vec3(1.0, 0.95, 0.8) * foam * 1.2;
-      col *= 1.0 + smoothstep(0.86, 1.0, vUv.y) * 1.1;    /* glowing lip */
+      col += vec3(1.0, 0.95, 0.8) * foam;
+      col *= 1.0 + smoothstep(0.86, 1.0, vUv.y) * 0.55;   /* glowing lip */
       float edge = smoothstep(0.0, 0.2, vUv.x) * (1.0 - smoothstep(0.8, 1.0, vUv.x));
       float tail = smoothstep(0.0, 0.26, vUv.y);
       float a = edge * tail * (0.3 + streak*0.42 + foam*0.5);
       a *= 1.0 - fogFactor(distance(cameraPosition, vW), uFogDensity)*0.6;
-      gl_FragColor = vec4(col * a * 1.5, a);
+      gl_FragColor = vec4(col * a * 1.05, a);
     }
   `
 });
@@ -918,7 +921,7 @@ for (const isl of ISLANDS){
   occluders.push(body);
 
   /* grass */
-  const nGrass = Math.floor(isl.r * 11);
+  const nGrass = Math.floor(isl.r * 7);
   const grass = new THREE.InstancedMesh(grassGeo, grassMat, nGrass);
   for (let i = 0; i < nGrass; i++){
     const a = R()*Math.PI*2, d = Math.sqrt(R())*0.86*isl.r;
@@ -928,22 +931,22 @@ for (const isl of ISLANDS){
     dummy.scale.setScalar(RR(0.7, 1.6));
     dummy.updateMatrix();
     grass.setMatrixAt(i, dummy.matrix);
-    tmpColor.setHSL(0.105 + R()*0.035, RR(0.5, 0.7), RR(0.4, 0.56));
+    tmpColor.setHSL(0.105 + R()*0.035, RR(0.5, 0.66), RR(0.42, 0.52));
     grass.setColorAt(i, tmpColor);
   }
   grass.frustumCulled = false;
   group.add(grass);
 
   /* wildflowers */
-  const nFl = Math.floor(isl.r * 1.6);
+  const nFl = Math.floor(isl.r * 1.2);
   const flowers = new THREE.InstancedMesh(flowerGeo, flowerMat, nFl);
-  const flTints = [new THREE.Color(1.3, 1.25, 1.1), new THREE.Color(1.35, 1.05, 0.95), new THREE.Color(1.4, 1.2, 0.75)];
+  const flTints = [new THREE.Color(1.12, 1.08, 0.98), new THREE.Color(1.15, 0.95, 0.88), new THREE.Color(1.18, 1.04, 0.7)];
   for (let i = 0; i < nFl; i++){
     const a = R()*Math.PI*2, d = Math.sqrt(R())*0.8*isl.r;
     const x = Math.cos(a)*d, z = Math.sin(a)*d;
     dummy.position.set(x, islandTopY(isl.r, isl.seed, x, z) + RR(0.3, 0.9), z);
     dummy.rotation.set(0, R()*Math.PI, 0);
-    dummy.scale.setScalar(RR(0.5, 1.1));
+    dummy.scale.setScalar(RR(0.7, 1.3));
     dummy.updateMatrix();
     flowers.setMatrixAt(i, dummy.matrix);
     flowers.setColorAt(i, flTints[(R()*3)|0]);
@@ -1030,7 +1033,7 @@ for (const isl of ISLANDS){
   }
 
   /* cloud wisps hanging beneath */
-  group.add(makeWisps(9 + (isl.r/12|0), isl.r));
+  group.add(makeWisps(6 + (isl.r/16|0), isl.r));
 
   /* waterfall of liquid gold light + ember burst at its base */
   if (isl.fall){
@@ -1050,7 +1053,7 @@ for (const isl of ISLANDS){
     fall.frustumCulled = false;
     group.add(fall);
     const base = new THREE.Vector3(px + out.x*10, MIST_Y + 8 - isl.y, pz + out.z*10);
-    group.add(makeEmbers(120, base, width*1.4));
+    group.add(makeEmbers(90, base, width*1.4));
     fallInfos.push({ island: isl, angle: a, top: new THREE.Vector3(isl.x + px, isl.y + topY, isl.z + pz) });
   }
 }
@@ -1100,6 +1103,7 @@ function makeDriftClouds({ count, yMin, yMax, sMin, sMax, alpha, lantern, span, 
         vUv = uv; vTint = aTint;
         vec3 base = aPos;
         base.x = mod(base.x + uTime*aSpd + uSpan, uSpan*2.0) - uSpan;
+        float edgeFade = 1.0 - smoothstep(uSpan*0.82, uSpan, abs(base.x));
         float rot = aPar.z + uTime*aPar.w;
         vec2 off = position.xy * aPar.x;
         off = mat2(cos(rot), -sin(rot), sin(rot), cos(rot)) * off;
@@ -1108,7 +1112,7 @@ function makeDriftClouds({ count, yMin, yMax, sMin, sMax, alpha, lantern, span, 
         vec3 wp = base + right*off.x + up*off.y;
         vec4 mv = viewMatrix * vec4(wp, 1.0);
         vDist = -mv.z;
-        vAlpha = aPar.y;
+        vAlpha = aPar.y * edgeFade;   /* no pop when a puff wraps around */
         gl_Position = projectionMatrix * mv;
       }
     `,
@@ -1134,10 +1138,11 @@ function makeDriftClouds({ count, yMin, yMax, sMin, sMax, alpha, lantern, span, 
   scene.add(mesh);
   return mesh;
 }
-makeDriftClouds({ count: 70, yMin: 230, yMax: 420, sMin: 190, sMax: 430, alpha: 0.32, lantern: 0.22, span: 1500, zMin: -1700, zMax: 700, order: 5 });
-makeDriftClouds({ count: 60, yMin: -20, yMax: 130, sMin: 120, sMax: 300, alpha: 0.26, lantern: 0.16, span: 1300, zMin: -1500, zMax: 700, order: 5 });
-makeDriftClouds({ count: 70, yMin: -250, yMax: -140, sMin: 260, sMax: 640, alpha: 0.5, lantern: 0.12, span: 1500, zMin: -1700, zMax: 800, order: 4 });
-makeDriftClouds({ count: 34, yMin: -120, yMax: 40, sMin: 220, sMax: 520, alpha: 0.16, lantern: 0.1, span: 1600, zMin: -1200, zMax: 800, order: 5 });
+makeDriftClouds({ count: 46, yMin: 230, yMax: 420, sMin: 190, sMax: 430, alpha: 0.32, lantern: 0.22, span: 1500, zMin: -1700, zMax: 700, order: 5 });
+makeDriftClouds({ count: 40, yMin: -20, yMax: 130, sMin: 120, sMax: 300, alpha: 0.26, lantern: 0.16, span: 1300, zMin: -1500, zMax: 700, order: 5 });
+makeDriftClouds({ count: 48, yMin: -250, yMax: -140, sMin: 260, sMax: 640, alpha: 0.5, lantern: 0.12, span: 1500, zMin: -1700, zMax: 800, order: 4 });
+/* near-field layer draws after wisps/petals so they can't bleed through it */
+makeDriftClouds({ count: 22, yMin: -120, yMax: 40, sMin: 220, sMax: 520, alpha: 0.16, lantern: 0.1, span: 1600, zMin: -1200, zMax: 800, order: 8 });
 
 /* mist floor plane */
 const mistFloor = new THREE.Mesh(
@@ -1163,7 +1168,7 @@ const mistFloor = new THREE.Mesh(
       void main(){
         vec2 p = vUv * 9.0;
         float n = fbm(p + vec2(uTime*0.012, uTime*0.007));
-        float n2 = fbm(p*2.3 - vec2(uTime*0.02, 0.0));
+        float n2 = vnoise(p*4.6 - vec2(uTime*0.02, 0.0));   // cheaper than a second fbm
         vec3 col = mix(vec3(0.72, 0.42, 0.18), vec3(1.02, 0.82, 0.55), n);
         float edge = 1.0 - smoothstep(0.28, 0.5, distance(vUv, vec2(0.5)));
         float a = (0.5 + 0.36*n + 0.2*n2) * edge;
@@ -1298,9 +1303,9 @@ function makeMotes(count, center, size, color, pSize, alpha){
   scene.add(pts);
   return pts;
 }
-makeMotes(900,  [0, 40, 0],      [520, 260, 520], 0xffe3ae, 0.9, 0.5);   // dust
-makeMotes(320,  [30, 60, -900],  [320, 220, 480], 0xffe3ae, 1.1, 0.45);  // gate corridor dust
-makeMotes(500,  [0, 60, 20],     [400, 120, 400], 0xfff2cf, 1.7, 0.8);   // sparkling pollen over meadows
+makeMotes(620,  [0, 40, 0],      [520, 260, 520], 0xffe3ae, 0.9, 0.5);   // dust
+makeMotes(220,  [30, 60, -900],  [320, 220, 480], 0xffe3ae, 1.1, 0.45);  // gate corridor dust
+makeMotes(340,  [0, 60, 20],     [400, 120, 400], 0xfff2cf, 1.7, 0.8);   // sparkling pollen over meadows
 
 /* feathers + petals: instanced quads, tumbling in JS (cheap) */
 function makeDrifters({ count, tex, size, area, yTop, yFall, tint, spin, sway }){
@@ -1358,7 +1363,7 @@ scene.add(leafMesh);
 const leafState = [];
 for (let i = 0; i < LEAF_N; i++){
   leafState.push({ phase: R(), speed: RR(0.02, 0.04), tree: (R()*treeWorldPositions.length)|0,
-                   ph2: R()*Math.PI*2, pos: new THREE.Vector3(), trail: [] });
+                   ph2: R()*Math.PI*2, pos: new THREE.Vector3(), trail: [], lastLife: 1 });
   for (let j = 0; j < TRAIL_N; j++) leafState[i].trail.push(new THREE.Vector3(0, -9999, 0));
 }
 const trailGeo = new THREE.BufferGeometry();
@@ -1398,9 +1403,9 @@ function updateLeaves(t, dt){
   for (let i = 0; i < LEAF_N; i++){
     const s = leafState[i];
     const life = (t*s.speed + s.phase) % 1;
-    if (life < dt*s.speed*2 || s.pos.y < -9000){
-      s.tree = (R()*treeWorldPositions.length)|0;
-    }
+    const respawn = life < s.lastLife - 0.5;   // life wrapped → pick a new tree
+    s.lastLife = life;
+    if (respawn) s.tree = (R()*treeWorldPositions.length)|0;
     const tp = treeWorldPositions[s.tree];
     s.pos.set(
       tp.x + Math.sin(life*9 + s.ph2)*7 + life*34*Math.sin(s.ph2),
@@ -1413,9 +1418,12 @@ function updateLeaves(t, dt){
     dummy.scale.setScalar(pop);
     dummy.updateMatrix();
     leafMesh.setMatrixAt(i, dummy.matrix);
-    /* trailing light: follow-chain */
+    /* trailing light: follow-chain; snap on respawn or any teleport-sized gap
+       (tab restore) so the trail never streaks across the sky */
     const k = 1 - Math.exp(-dt*7);
-    if (s.trail[0].y < -8000) for (const tr of s.trail) tr.copy(s.pos);
+    if (respawn || s.trail[0].y < -8000 || s.trail[0].distanceToSquared(s.pos) > 8100){
+      for (const tr of s.trail) tr.copy(s.pos);
+    }
     s.trail[0].lerp(s.pos, k);
     for (let j = 1; j < TRAIL_N; j++) s.trail[j].lerp(s.trail[j-1], k);
     for (let j = 0; j < TRAIL_N; j++){
@@ -1535,11 +1543,16 @@ function updateBirds(t){
 /* ============================================================
    11. Post-processing — warm bloom, grade, vignette
    ============================================================ */
-/* EffectComposer defaults to a HalfFloat target in r160 — HDR for bloom.
-   No MSAA: bloom + soft fog hide aliasing, and fill-rate stays cheap. */
-const composer = new EffectComposer(renderer);
+/* HDR half-float target with 2x MSAA: thin grass blades, crystal facets and
+   tree edges shimmer badly without multisampling. The last quality step
+   turns MSAA off (see setPixelLevel). */
+const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(innerWidth, innerHeight, {
+  type: THREE.HalfFloatType, samples: 2,
+}));
 composer.addPass(new RenderPass(scene, camera));
-const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.62, 0.5, 0.88);
+/* threshold 0.95: bloom hugs the genuinely hot things (sun, falls, portal)
+   and stops grabbing sub-pixel meadow highlights, which reads as flicker */
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.65, 0.45, 0.95);
 composer.addPass(bloom);
 const gradePass = new ShaderPass({
   uniforms: { tDiffuse: { value: null } },
@@ -1702,9 +1715,17 @@ if (qp.has('t')) window.__heaven.setTour(tour.t);
 const clock = new THREE.Clock();
 let emaMs = 16;
 let qTimer = 0;
+let bestMs = 1000;   // fastest observed frame ≈ the display's refresh interval
 
 function setPixelLevel(lv){
   pixelLevel = lv;
+  if (lv === PIXEL_STEPS.length - 1){
+    /* final step: drop MSAA too — dispose forces reallocation without samples */
+    for (const rt of [composer.renderTarget1, composer.renderTarget2]){
+      rt.samples = 0;
+      rt.dispose();
+    }
+  }
   onResize();
 }
 function onResize(){
@@ -1725,7 +1746,9 @@ function animate(){
   requestAnimationFrame(animate);
   const dt = Math.min(0.05, clock.getDelta());
   const t = clock.elapsedTime;
-  uTime.value = t;
+  /* wrapped shader clock: raw elapsed time quantizes in float32 after hours
+     of runtime and shader motion turns stuttery */
+  uTime.value = t % 3600;
 
   /* islands bob and turn very slowly, resting on the light */
   for (const g of islandGroups){
@@ -1748,12 +1771,15 @@ function animate(){
 
   composer.render();
 
-  /* adaptive quality: step pixel ratio down if we cannot hold ~50fps */
+  /* adaptive quality: step down if frames run well over the display's own
+     refresh interval (an absolute cutoff would wrongly degrade forever on
+     30Hz screens or battery-throttled rAF) */
+  if (frames > 30) bestMs = Math.min(bestMs, dt*1000);
   emaMs = emaMs*0.96 + dt*1000*0.04;
   qTimer += dt;
-  if (qTimer > 5){
+  if (qTimer > 4){
     qTimer = 0;
-    if (emaMs > 21 && pixelLevel < PIXEL_STEPS.length - 1) setPixelLevel(pixelLevel + 1);
+    if (emaMs > Math.max(21, bestMs*1.35) && pixelLevel < PIXEL_STEPS.length - 1) setPixelLevel(pixelLevel + 1);
   }
 
   frames++;
