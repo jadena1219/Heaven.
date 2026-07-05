@@ -95,7 +95,9 @@ function fbm3(x, y, z, s, oct){ return (fbm2(x + z*0.7, y - z*0.4, s, oct) + fbm
 const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
 renderer.setSize(innerWidth, innerHeight);
 let pixelLevel = 0;
-const PIXEL_STEPS = [1.5, 1.15, 0.85];
+/* effective, deduplicated quality steps: on a dpr-1 display the first
+   step-down must actually lower resolution, not clamp to the same value */
+const PIXEL_STEPS = [...new Set([1.5, 1.15, 0.85].map(s => Math.min(devicePixelRatio || 1, s)))];
 renderer.setPixelRatio(Math.min(devicePixelRatio, PIXEL_STEPS[pixelLevel]));
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.0;
@@ -717,6 +719,8 @@ const flowerGeo = new THREE.PlaneGeometry(1.5, 1.5);
 flowerGeo.translate(0, 0.75, 0);
 const vineGeo = new THREE.PlaneGeometry(1.6, 9, 1, 3);
 vineGeo.translate(0, -4.5, 0);
+const rockGeo = new THREE.IcosahedronGeometry(1, 0);
+const rockMat = new THREE.MeshLambertMaterial({ color: 0xf4e5c6 });
 
 /* --- waterfall shader --------------------------------------- */
 const fallMat = new THREE.ShaderMaterial({
@@ -961,6 +965,22 @@ for (const isl of ISLANDS){
   }
   vines.frustumCulled = false;
   group.add(vines);
+
+  /* soft white stones breaking through the meadow */
+  const nRock = Math.max(5, (isl.r * 0.24)|0);
+  const rocks = new THREE.InstancedMesh(rockGeo, rockMat, nRock);
+  for (let i = 0; i < nRock; i++){
+    const a = R()*Math.PI*2, d = Math.sqrt(R())*0.78*isl.r;
+    const x = Math.cos(a)*d, z = Math.sin(a)*d;
+    const sy = RR(0.5, 1.4);
+    dummy.position.set(x, islandTopY(isl.r, isl.seed, x, z) - sy*0.35, z);
+    dummy.rotation.set(R()*Math.PI, R()*Math.PI, R()*Math.PI);
+    dummy.scale.set(RR(0.7, 2.2), sy, RR(0.7, 2.2));
+    dummy.updateMatrix();
+    rocks.setMatrixAt(i, dummy.matrix);
+  }
+  rocks.frustumCulled = false;
+  group.add(rocks);
 
   /* crystals: hanging clusters beneath + a few sprouting on top */
   const shards = [];
@@ -1566,14 +1586,13 @@ const lookPoints = [
 const camCurve  = new THREE.CatmullRomCurve3(camPoints,  true, 'centripetal', 0.5);
 const lookCurve = new THREE.CatmullRomCurve3(lookPoints, true, 'centripetal', 0.5);
 
-const tour = { t: 0, active: true };
+const tour = { t: 0 };
 const lookSmooth = lookCurve.getPoint(0).clone();
 const camSmooth  = camCurve.getPointAt(0).clone();
 
 const fly = {
   on: false, yaw: 0, pitch: 0,
   pos: new THREE.Vector3(), keys: {},
-  blend: 1,  // 1 = fully in current mode
 };
 const hintEl = document.getElementById('hint');
 let hintTimer = 0;
@@ -1591,17 +1610,27 @@ addEventListener('keydown', (e) => {
       fly.pos.copy(camera.position);
       const e2 = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ');
       fly.yaw = e2.y; fly.pitch = e2.x;
-      showHint('free flight — click to look · WASD move · Space / Shift-Space up-down · Shift fast · C to return');
+      showHint('free flight — click to look · WASD move · Space up · Q down · Shift fast · C to return');
     } else {
       showHint('cinematic tour — press C to fly free');
       if (document.pointerLockElement) document.exitPointerLock();
+      /* re-seed the tour gaze from the current view so resuming never snaps */
+      camera.getWorldDirection(_fwd);
+      lookSmooth.copy(camera.position).addScaledVector(_fwd, 120);
     }
   }
   fly.keys[e.code] = true;
 });
 addEventListener('keyup', (e) => { fly.keys[e.code] = false; });
+addEventListener('blur', () => { fly.keys = {}; });   // no stuck keys after alt-tab
+document.addEventListener('pointerlockchange', () => {
+  if (fly.on && !document.pointerLockElement) showHint('mouse released — click to look again · C to return to the tour');
+});
 renderer.domElement.addEventListener('mousedown', () => {
-  if (fly.on && !document.pointerLockElement) renderer.domElement.requestPointerLock();
+  if (fly.on && !document.pointerLockElement){
+    const p = renderer.domElement.requestPointerLock();
+    if (p && p.catch) p.catch(() => {});   // rejects inside the post-Esc cooldown
+  }
 });
 addEventListener('mousemove', (e) => {
   if (fly.on && document.pointerLockElement === renderer.domElement){
@@ -1622,8 +1651,9 @@ function updateCamera(t, dt){
     if (fly.keys['KeyS']) _mv.sub(_fwd);
     if (fly.keys['KeyD']) _mv.add(_rgt);
     if (fly.keys['KeyA']) _mv.sub(_rgt);
-    if (fly.keys['Space']) _mv.y += fly.keys['ShiftLeft'] || fly.keys['ShiftRight'] ? -1 : 1;
-    const speed = (fly.keys['ShiftLeft'] || fly.keys['ShiftRight']) && !fly.keys['Space'] ? 160 : 55;
+    if (fly.keys['Space']) _mv.y += 1;
+    if (fly.keys['KeyQ']) _mv.y -= 1;
+    const speed = (fly.keys['ShiftLeft'] || fly.keys['ShiftRight']) ? 160 : 55;
     if (_mv.lengthSq() > 0) fly.pos.addScaledVector(_mv.normalize(), speed*dt);
     camera.position.copy(fly.pos);
     camSmooth.copy(camera.position);
@@ -1647,12 +1677,16 @@ function updateCamera(t, dt){
 
 /* debug/screenshot hooks */
 const qp = new URLSearchParams(location.search);
-if (qp.has('t')) tour.t = parseFloat(qp.get('t')) || 0;
+if (qp.has('t')){
+  const v = parseFloat(qp.get('t'));
+  tour.t = Number.isFinite(v) ? ((v % 1) + 1) % 1 : 0;   // out-of-range t would NaN the curves
+}
 window.__heaven = {
   ready: false,
   info: () => ({ calls: renderer.info.render.calls, tris: renderer.info.render.triangles,
                  geoms: renderer.info.memory.geometries, progs: renderer.info.programs.length }),
   setTour(tt){
+    tt = ((tt % 1) + 1) % 1;
     tour.t = tt;
     const p = camCurve.getPointAt(tt);
     const l = lookCurve.getPoint((camCurve.getUtoTmapping(tt, 0) + 0.002) % 1);
@@ -1671,16 +1705,16 @@ let qTimer = 0;
 
 function setPixelLevel(lv){
   pixelLevel = lv;
-  renderer.setPixelRatio(Math.min(devicePixelRatio, PIXEL_STEPS[lv]));
-  composer.setPixelRatio(Math.min(devicePixelRatio, PIXEL_STEPS[lv]));
   onResize();
 }
 function onResize(){
   camera.aspect = innerWidth/innerHeight;
   camera.updateProjectionMatrix();
+  const pr = Math.min(devicePixelRatio, PIXEL_STEPS[pixelLevel]);
+  renderer.setPixelRatio(pr);
+  composer.setPixelRatio(pr);
   renderer.setSize(innerWidth, innerHeight);
   composer.setSize(innerWidth, innerHeight);
-  const pr = Math.min(devicePixelRatio, PIXEL_STEPS[pixelLevel]);
   emberUniformsShared.uPx.value = (innerHeight * pr) / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov*0.5)));
 }
 addEventListener('resize', onResize);

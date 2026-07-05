@@ -27,7 +27,7 @@ python3 -m http.server
 | `C` | Toggle free-fly |
 | Click | Capture the mouse (free-fly) |
 | `W A S D` | Move |
-| `Space` / `Shift`+`Space` | Rise / sink |
+| `Space` / `Q` | Rise / sink |
 | `Shift` | Fly fast |
 | `Esc` | Release the mouse |
 
