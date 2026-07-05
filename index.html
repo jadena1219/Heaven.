@@ -530,8 +530,13 @@ function buildIslandGeometry(r, seed){
     colors[i*3] = tmp.r; colors[i*3+1] = tmp.g; colors[i*3+2] = tmp.b;
   }
   g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-  g.computeVertexNormals();
-  return g;
+  /* islands are untextured: drop uv+normal and weld the sphere's UV seam
+     so computeVertexNormals gives a seamless shading gradient */
+  g.deleteAttribute('uv');
+  g.deleteAttribute('normal');
+  const welded = BufferGeometryUtils.mergeVertices(g);
+  welded.computeVertexNormals();
+  return welded;
 }
 
 /* --- shared materials -------------------------------------- */
