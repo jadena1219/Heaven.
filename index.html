@@ -4,9 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Heaven — Isles of Gold</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='30' fill='%23ffce7a'/><circle cx='50' cy='50' r='44' fill='none' stroke='%23ffce7a' stroke-opacity='.45' stroke-width='6'/></svg>">
 <style>
   html, body { margin:0; padding:0; overflow:hidden; background:#f2bd79; height:100%; }
-  canvas { display:block; }
+  canvas { display:block; touch-action:none; }
   #title {
     position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
     pointer-events:none; z-index:10; opacity:0; transition:opacity 2.8s ease;
@@ -18,8 +19,9 @@
   #title p  { font-size:clamp(13px, 1.6vw, 19px); letter-spacing:.5em; margin:0 0 0 .5em; opacity:.85; font-style:italic; }
   #hint {
     position:fixed; left:50%; bottom:26px; transform:translateX(-50%);
-    padding:9px 20px; border-radius:999px; z-index:10; pointer-events:none;
-    font:13px/1.5 Georgia, serif; letter-spacing:.14em; color:#fff3da; white-space:nowrap;
+    padding:9px 20px; border-radius:22px; z-index:10; pointer-events:none;
+    font:13px/1.5 Georgia, serif; letter-spacing:.14em; color:#fff3da;
+    max-width:min(92vw, 640px); text-align:center;
     background:rgba(84,52,18,.28); backdrop-filter:blur(6px);
     text-shadow:0 0 12px rgba(255,205,130,.8);
     border:1px solid rgba(255,226,170,.25);
@@ -31,12 +33,23 @@
     font:12px/1.4 monospace; color:#5a1a00; background:rgba(255,240,220,.9);
     padding:8px 10px; border-radius:6px; display:none; white-space:pre-wrap;
   }
+  #loader {
+    position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    z-index:15; pointer-events:none; text-align:center;
+    font:italic 15px/1.8 Georgia, serif; letter-spacing:.4em; color:#7a4d15;
+    text-shadow:0 0 22px rgba(255,236,190,.9);
+    animation:loaderPulse 2.6s ease-in-out infinite;
+    transition:opacity 1.8s ease;
+  }
+  #loader.hide { opacity:0; animation:none; }
+  @keyframes loaderPulse { 0%,100% { opacity:.35; } 50% { opacity:.9; } }
 </style>
 </head>
 <body>
 <div id="title"><h1>H E A V E N</h1><p>the isles of gold</p></div>
 <div id="hint"></div>
 <div id="err"></div>
+<div id="loader">gathering light…</div>
 
 <script type="importmap">
 {
@@ -55,6 +68,21 @@
     d.style.display = 'block';
     d.textContent = window.__errors.join('\n');
   });
+  window.addEventListener('unhandledrejection', (e) => {
+    window.__errors.push('unhandled rejection: ' + String(e.reason && e.reason.message || e.reason));
+    const d = document.getElementById('err');
+    d.style.display = 'block';
+    d.textContent = window.__errors.join('\n');
+  });
+  /* a failed CDN import dies before the module can say anything — watchdog it */
+  window.__loadWatchdog = setTimeout(() => {
+    if (!(window.__heaven && window.__heaven.ready)){
+      const l = document.getElementById('loader');
+      l.style.animation = 'none';
+      l.style.opacity = 1;
+      l.innerHTML = 'the light is not reaching us —<br>check your connection and reload';
+    }
+  }, 12000);
 </script>
 
 <script type="module">
@@ -94,14 +122,22 @@ function fbm3(x, y, z, s, oct){ return (fbm2(x + z*0.7, y - z*0.4, s, oct) + fbm
    ============================================================ */
 const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
 renderer.setSize(innerWidth, innerHeight);
-let pixelLevel = 0;
-/* effective, deduplicated quality steps: on a dpr-1 display the first
-   step-down must actually lower resolution, not clamp to the same value.
-   Base cap is 1.25 — MSAA carries edge quality instead of raw resolution */
-const PIXEL_STEPS = [...new Set([1.25, 1.0, 0.8].map(s => Math.min(devicePixelRatio || 1, s)))];
-renderer.setPixelRatio(Math.min(devicePixelRatio, PIXEL_STEPS[pixelLevel]));
+let pixelLevel = 2;   // start mid-ladder; the controller walks both ways from here
+/* quality ladder: px is an ABSOLUTE render scale — above the display's own
+   dpr it acts as supersampling, the only antialiasing that also calms
+   shader shimmer (grass speculars, crystal fresnel), which MSAA cannot
+   touch. The controller steps down when frames sag and back up when there
+   is headroom to spend; msaa changes ride along at the rungs that need them. */
+const QUALITY = [
+  { px: 2.0,  msaa: 4 },   // supersample + heavy MSAA — strong GPUs earn this
+  { px: 1.5,  msaa: 2 },
+  { px: 1.25, msaa: 2 },   // default
+  { px: 1.0,  msaa: 2 },
+  { px: 0.8,  msaa: 0 },   // survival mode
+];
+renderer.setPixelRatio(QUALITY[pixelLevel].px);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.0;
+renderer.toneMappingExposure = 0.55;   // dawn ramp: the auto-iris eases this up to ~1.0 over the first seconds
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 document.body.appendChild(renderer.domElement);
 
@@ -118,6 +154,50 @@ camera.position.set(40, 150, 560);
 const uTime = { value: 0 };
 const SUN_DIR = new THREE.Vector3(0.05, 0.185, -0.982).normalize();
 const SUN_POS = SUN_DIR.clone().multiplyScalar(4200);
+
+/* Directional aerial perspective for every built-in-fog material (islands,
+   meadows, trees, rocks, drifting petals): same math as fogTint/fogFactor2
+   in GLSL_FOGF, patched into three's fog chunks before the first compile. */
+THREE.ShaderChunk.fog_pars_vertex = /* glsl */`
+#ifdef USE_FOG
+  varying float vFogDepth;
+  varying vec3 vFogWorld;
+#endif`;
+THREE.ShaderChunk.fog_vertex = /* glsl */`
+#ifdef USE_FOG
+  vFogDepth = - mvPosition.z;
+  vec4 fogW = vec4(transformed, 1.0);
+  #ifdef USE_INSTANCING
+    fogW = instanceMatrix * fogW;
+  #endif
+  vFogWorld = (modelMatrix * fogW).xyz;
+#endif`;
+THREE.ShaderChunk.fog_pars_fragment = /* glsl */`
+#ifdef USE_FOG
+  uniform vec3 fogColor;
+  varying float vFogDepth;
+  varying vec3 vFogWorld;
+  #ifdef FOG_EXP2
+    uniform float fogDensity;
+  #else
+    uniform float fogNear;
+    uniform float fogFar;
+  #endif
+#endif`;
+THREE.ShaderChunk.fog_fragment = /* glsl */`
+#ifdef USE_FOG
+  vec3 fogRd = normalize(vFogWorld - cameraPosition);
+  float fogHgt = mix(1.3, 0.7, smoothstep(-235.0, 160.0, vFogWorld.y));
+  #ifdef FOG_EXP2
+    float fogFac = 1.0 - exp(- fogDensity * fogDensity * fogHgt * fogHgt * vFogDepth * vFogDepth);
+  #else
+    float fogFac = smoothstep(fogNear, fogFar, vFogDepth);
+  #endif
+  float fogSun = max(dot(fogRd, vec3(0.04997, 0.18490, -0.98149)), 0.0);
+  vec3 fogTinted = mix(vec3(0.68, 0.44, 0.28), fogColor, 0.55 + 0.45*fogSun)
+                 + vec3(1.05, 0.76, 0.46) * pow(fogSun, 6.0) * 0.35;
+  gl_FragColor.rgb = mix(gl_FragColor.rgb, fogTinted, fogFac);
+#endif`;
 const MIST_Y  = -235;
 const GATE_POS = new THREE.Vector3(60, 40, -1500);
 
@@ -275,10 +355,28 @@ const GLSL_NOISE = /* glsl */`
     for (int i = 0; i < 5; i++){ v += a*vnoise(p); p *= 2.03; a *= 0.5; }
     return v;
   }
+  float fbm3o(vec2 p){   /* 3 octaves — for low-amplitude detail where 4-5 sink below the dither floor */
+    float v = 0.0, a = 0.5;
+    for (int i = 0; i < 3; i++){ v += a*vnoise(p); p *= 2.03; a *= 0.5; }
+    return v;
+  }
 `;
 const GLSL_FOGF = /* glsl */`
   float fogFactor(float dist, float density){
     float f = dist * density;
+    return 1.0 - exp(-f*f);
+  }
+  /* directional aerial perspective — the haze knows where the sun is:
+     warm gold looking sunward, dusty rose away (the Belt of Venus),
+     and it pools thicker near the mist sea than at altitude */
+  vec3 fogTint(vec3 rd, vec3 baseCol){
+    float s = max(dot(rd, vec3(${SUN_DIR.x.toFixed(5)}, ${SUN_DIR.y.toFixed(5)}, ${SUN_DIR.z.toFixed(5)})), 0.0);
+    return mix(vec3(0.68, 0.44, 0.28), baseCol, 0.55 + 0.45*s)
+         + vec3(1.05, 0.76, 0.46) * pow(s, 6.0) * 0.35;
+  }
+  float fogHeight(float y){ return mix(1.3, 0.7, smoothstep(-235.0, 160.0, y)); }
+  float fogFactor2(float dist, float density, float y){
+    float f = dist * density * fogHeight(y);
     return 1.0 - exp(-f*f);
   }
 `;
@@ -287,7 +385,7 @@ const GLSL_FOGF = /* glsl */`
    4. Sky dome — golden hour, huge soft sun, aurora bands
    ============================================================ */
 const skyMat = new THREE.ShaderMaterial({
-  side: THREE.BackSide, depthWrite: false, depthTest: false, fog: false,
+  side: THREE.BackSide, depthWrite: false, depthTest: true, fog: false,
   uniforms: { uTime, uSunDir: { value: SUN_DIR } },
   vertexShader: /* glsl */`
     varying vec3 vDir;
@@ -311,6 +409,14 @@ const skyMat = new THREE.ShaderMaterial({
       vec3 col = mix(mid, zen, smoothstep(0.05, 0.7, h));
       col = mix(low, col, smoothstep(-0.28, 0.12, h));
       col = mix(col, low*0.82, smoothstep(0.35, 0.95, -h));
+      /* cool lilac high overhead — the gold sings against its complement */
+      col = mix(col, vec3(0.37, 0.35, 0.44), smoothstep(0.45, 0.95, h)*0.45);
+      /* horizon warmth follows the sun's bearing; the anti-sun side falls dusty */
+      vec2 dxz = dir.xz / max(length(dir.xz), 1e-4);
+      float azs = pow(max(dot(dxz, normalize(uSunDir.xz)), 0.0), 2.0);
+      col += vec3(1.0, 0.62, 0.34) * pow(1.0 - abs(h), 3.0) * mix(-0.06, 0.20, azs);
+      /* faint salmon band low in the sky */
+      col += vec3(0.98, 0.55, 0.4) * smoothstep(0.10, 0.16, h) * (1.0 - smoothstep(0.19, 0.30, h)) * 0.10;
       /* huge soft low sun */
       float sd = max(dot(dir, uSunDir), 0.0);
       float disc = smoothstep(0.9962, 0.99905, sd);
@@ -324,8 +430,8 @@ const skyMat = new THREE.ShaderMaterial({
       vec3 aurCol = mix(vec3(0.9, 0.42, 0.42), vec3(0.95, 0.7, 0.4),
                         vnoise(sp*4.0 + uTime*0.02));
       col += aurCol * aur * 0.34;
-      /* faint high cloud streaks */
-      col += vec3(0.9, 0.62, 0.36) * fbm(vec2((sp.x - sp.y*0.6)*7.0 + uTime*0.004, dir.y*9.0)) * 0.07 * smoothstep(0.0, 0.35, h);
+      /* faint high cloud streaks — 3 octaves: at 0.07 amplitude the rest sinks below the dither */
+      col += vec3(0.9, 0.62, 0.36) * fbm3o(vec2((sp.x - sp.y*0.6)*7.0 + uTime*0.004, dir.y*9.0)) * 0.07 * smoothstep(0.0, 0.35, h);
       /* dither to kill banding */
       col += (hash12(gl_FragCoord.xy) - 0.5) * 0.004;
       gl_FragColor = vec4(col, 1.0);
@@ -333,7 +439,10 @@ const skyMat = new THREE.ShaderMaterial({
   `
 });
 const sky = new THREE.Mesh(new THREE.SphereGeometry(4800, 40, 24), skyMat);
-sky.renderOrder = -100;
+/* draw AFTER the opaque world (but before the transparent pass, which starts
+   at renderOrder 3): with depthTest on, every island-covered pixel of this
+   full-screen fbm shader is early-z rejected instead of shaded */
+sky.renderOrder = 2;
 sky.frustumCulled = false;
 scene.add(sky);
 
@@ -349,7 +458,22 @@ scene.add(sunSprite);
 
 /* screen-space lens flare — sprites re-positioned along the sun→center axis
    every frame; no framebuffer readbacks so it is composer-safe */
+/* anamorphic streak — a thin horizontal blade of light through the sun */
+const texStreak = canvasTex(256, (g, s) => {
+  g.clearRect(0, 0, s, s);
+  g.save();
+  g.translate(s/2, s/2);
+  g.scale(1, 0.055);
+  const gr = g.createRadialGradient(0, 0, 0, 0, 0, s/2);
+  gr.addColorStop(0,    'rgba(255,244,220,0.95)');
+  gr.addColorStop(0.35, 'rgba(255,220,160,0.5)');
+  gr.addColorStop(1,    'rgba(255,200,130,0)');
+  g.fillStyle = gr;
+  g.beginPath(); g.arc(0, 0, s/2, 0, 7); g.fill();
+  g.restore();
+});
 const FLARE_ELEMENTS = [
+  { tex: texStreak, px: 300, f: 0.0, color: [1.0, 0.87, 0.68], op: 0.5, w: 6.5, h: 0.9 },
   { tex: texGlow, px: 420, f: 0.0,  color: [1.0, 0.9, 0.72],  op: 0.55 },
   { tex: texRing, px: 190, f: 0.04, color: [1.0, 0.85, 0.6],  op: 0.30 },
   { tex: texRing, px: 330, f: 0.1,  color: [1.0, 0.8, 0.55],  op: 0.22 },
@@ -399,9 +523,17 @@ function updateFlare(dt){
     _flarePos.set(nx * tanF * camera.aspect * D, ny * tanF * D, -D);
     sp.position.copy(_flarePos.applyMatrix4(camera.matrixWorld));
     const sc = (el.px / innerHeight) * 2 * tanF * D;
-    sp.scale.set(sc, sc, 1);
+    sp.scale.set(sc * (el.w || 1), sc * (el.h || 1), 1);
     sp.material.opacity = el.op * flareVis;
   }
+  /* auto-iris: the eye stops down against the sun, opens in the shade of the
+     dive, and performs the dawn ramp from the low starting exposure */
+  const expTarget = 1.0 - flareVis*0.22
+                  + THREE.MathUtils.smoothstep(-camera.position.y, 40, 220)*0.14;
+  renderer.toneMappingExposure += (expTarget - renderer.toneMappingExposure) * Math.min(1, dt*0.8);
+  /* crepuscular rays ride flareVis; tap count set by the quality ladder */
+  gradeUniforms.uSunScreen.value.set(_sunNdc.x*0.5 + 0.5, _sunNdc.y*0.5 + 0.5);
+  gradeUniforms.uRayStrength.value = gradeUniforms.uTaps.value > 0 ? flareVis * 0.34 : 0;
 }
 
 /* ============================================================
@@ -456,8 +588,10 @@ function buildGodRays(){
         float pulse = 0.55 + 0.45*sin(uTime*0.07 + vSeed*13.7);
         vec3 vDir = normalize(cameraPosition - vW);
         float face = abs(dot(normalize(vN), vDir));
+        /* rays swell when the gaze turns into the light — true crepuscular behavior */
+        float toward = pow(max(dot(-vDir, vec3(${SUN_DIR.x.toFixed(5)}, ${SUN_DIR.y.toFixed(5)}, ${SUN_DIR.z.toFixed(5)})), 0.0), 3.0);
         /* emit alpha once — AdditiveBlending already multiplies rgb by SrcAlpha */
-        float a = ex*ex * ey * (0.30 + 0.7*flow) * pulse * face * 0.055;
+        float a = ex*ex * ey * (0.30 + 0.7*flow) * pulse * face * (0.045 + 0.05*toward);
         gl_FragColor = vec4(vec3(1.0, 0.78, 0.48), a);
       }
     `
@@ -548,14 +682,21 @@ function buildIslandGeometry(r, seed){
 const islandMat = new THREE.MeshLambertMaterial({ vertexColors: true });
 islandMat.onBeforeCompile = (shader) => {
   shader.uniforms.uRimColor = { value: new THREE.Color(0xffb367).multiplyScalar(0.38) };
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <common>', '#include <common>\nvarying vec3 vWorldN;')
+    .replace('#include <defaultnormal_vertex>', `#include <defaultnormal_vertex>
+      vWorldN = normalize(mat3(modelMatrix) * objectNormal);`);
   shader.fragmentShader = shader.fragmentShader
-    .replace('#include <common>', '#include <common>\nuniform vec3 uRimColor;')
+    .replace('#include <common>', '#include <common>\nuniform vec3 uRimColor;\nvarying vec3 vWorldN;')
     .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
       float rimF = pow(1.0 - saturate(dot(normalize(normal), normalize(vViewPosition))), 3.0);
-      totalEmissiveRadiance += uRimColor * rimF;`);
+      totalEmissiveRadiance += uRimColor * rimF;
+      /* the luminous mist sea bounces warm light up onto the crags above it */
+      totalEmissiveRadiance += vec3(1.0, 0.60, 0.28) * 0.22 * saturate(-vWorldN.y)
+                             * smoothstep(120.0, -180.0, vFogWorld.y);`);
 };
 
-function swayMaterial(base, weightExpr){
+function swayMaterial(base, weightExpr, colorRamp){
   base.onBeforeCompile = (shader) => {
     shader.uniforms.uTime = uTime;
     shader.vertexShader = shader.vertexShader
@@ -572,12 +713,20 @@ function swayMaterial(base, weightExpr){
         transformed.x += wnd * 0.34 * swayW;
         transformed.z += cos(uTime*1.5 + ph*1.3) * 0.24 * swayW;
       }`);
+    if (colorRamp){
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <color_vertex>', `#include <color_vertex>
+        vColor.rgb *= ${colorRamp};`);
+    }
   };
   return base;
 }
 const grassMat = swayMaterial(
   new THREE.MeshLambertMaterial({ side: THREE.DoubleSide, emissive: 0x3d2e0e, emissiveIntensity: 0.4 }),
-  'uv.y * uv.y');
+  'uv.y * uv.y',
+  /* root-to-tip ramp: blades darken into the turf and brighten at the tip —
+     each blade reads as an individual against its neighbours */
+  'mix(0.55, 1.15, uv.y * uv.y)');
 const vineMat = swayMaterial(
   new THREE.MeshLambertMaterial({ map: texVine, side: THREE.DoubleSide, transparent: false,
     alphaTest: 0.28, emissive: 0x54401c, emissiveIntensity: 0.6 }),
@@ -596,11 +745,18 @@ treeMatProto.onBeforeCompile = (shader) => {
       transformed.x += (sin(uTime*0.9 + ph) + 0.4*sin(uTime*2.2 + ph*1.9)) * 1.1 * swayW;
       transformed.z += cos(uTime*0.7 + ph*1.4) * 0.9 * swayW;
     }`);
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <common>', '#include <common>\nvarying vec3 vWorldN;')
+    .replace('#include <defaultnormal_vertex>', `#include <defaultnormal_vertex>
+      vWorldN = normalize(mat3(modelMatrix) * objectNormal);`);
   shader.fragmentShader = shader.fragmentShader
-    .replace('#include <common>', '#include <common>\nuniform vec3 uRimColor;')
+    .replace('#include <common>', '#include <common>\nuniform vec3 uRimColor;\nvarying vec3 vWorldN;')
     .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
       float rimF = pow(1.0 - saturate(dot(normalize(normal), normalize(vViewPosition))), 3.0);
-      totalEmissiveRadiance += uRimColor * rimF;`);
+      totalEmissiveRadiance += uRimColor * rimF;
+      /* mist-sea bounce warms the canopy from below */
+      totalEmissiveRadiance += vec3(1.0, 0.60, 0.28) * 0.16 * saturate(-vWorldN.y)
+                             * smoothstep(120.0, -180.0, vFogWorld.y);`);
 };
 
 const flowerMat = new THREE.MeshBasicMaterial({
@@ -649,8 +805,8 @@ function crystalShader(yRange, glowMul, fogMix){
         float fres = pow(1.0 - abs(dot(normalize(vN), vDir)), 2.0);
         float pulse = 0.72 + 0.28 * sin(uTime*1.4 + vPh);
         vec3 col = base * (0.55 + 0.45*pulse) + vec3(1.0, 0.86, 0.58) * fres * 1.7 * pulse * uGlow;
-        float ff = fogFactor(distance(cameraPosition, vW), uFogDensity) * uFogMix;
-        col = mix(col, uFogColor, ff);
+        float ff = fogFactor2(distance(cameraPosition, vW), uFogDensity, vW.y) * uFogMix;
+        col = mix(col, fogTint(normalize(vW - cameraPosition), uFogColor), ff);
         gl_FragColor = vec4(col, 1.0);
       }
     `
@@ -725,7 +881,13 @@ vineGeo.translate(0, -4.5, 0);
 const rockGeo = new THREE.IcosahedronGeometry(1, 0);
 const rockMat = new THREE.MeshLambertMaterial({ color: 0xf4e5c6 });
 
-/* --- waterfall shader --------------------------------------- */
+/* --- waterfall shader ---------------------------------------
+   NOTE on additive alpha: this shader (and embers/motes/leaf-trails) emits
+   rgb premultiplied by alpha, so under (SRC_ALPHA, ONE) the framebuffer sees
+   color*a^2 — a squared fade curve. The god rays / light pillar use the
+   emit-alpha-once convention instead. Both are deliberate: every constant
+   here was tuned by eye against its own curve. If you retune, keep each
+   shader's existing convention or retune ALL its constants. ------------- */
 const fallMat = new THREE.ShaderMaterial({
   transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
   side: THREE.DoubleSide, fog: false,
@@ -855,6 +1017,7 @@ function makeWisps(count, r){
       attribute vec4 aOrb; attribute vec4 aPar;
       uniform float uTime;
       varying vec2 vUv; varying float vAlpha; varying float vDist;
+      varying vec3 vW; varying float vBack;
       void main(){
         vUv = uv;
         float ang = aOrb.y + uTime * aOrb.z;
@@ -866,6 +1029,8 @@ function makeWisps(count, r){
         vec3 right = vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
         vec3 up    = vec3(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
         wc.xyz += right*off.x + up*off.y;
+        vW = wc.xyz;
+        vBack = pow(max(dot(normalize(wc.xyz - cameraPosition), vec3(${SUN_DIR.x.toFixed(5)}, ${SUN_DIR.y.toFixed(5)}, ${SUN_DIR.z.toFixed(5)})), 0.0), 5.0);
         vec4 mv = viewMatrix * wc;
         vDist = -mv.z;
         vAlpha = aPar.y;
@@ -876,12 +1041,16 @@ function makeWisps(count, r){
       uniform sampler2D uTex;
       uniform vec3 uFogColor; uniform float uFogDensity;
       varying vec2 vUv; varying float vAlpha; varying float vDist;
+      varying vec3 vW; varying float vBack;
       ${GLSL_FOGF}
       void main(){
         vec4 t = texture2D(uTex, vUv);
         float ff = fogFactor(vDist, uFogDensity);
         vec3 col = vec3(0.88, 0.7, 0.5);
-        col = mix(col, uFogColor, ff*0.9);
+        /* backlit silver-gold lining on the thin fringe of each puff */
+        float rim = t.a * (1.0 - smoothstep(0.06, 0.35, t.a));
+        col += vec3(1.35, 0.95, 0.55) * vBack * rim * 2.0;
+        col = mix(col, fogTint(normalize(vW - cameraPosition), uFogColor), ff*0.9);
         float a = t.a * vAlpha * (1.0 - ff*0.5);
         if (a < 0.004) discard;
         gl_FragColor = vec4(col, a);
@@ -917,6 +1086,7 @@ for (const isl of ISLANDS){
   islandGroups.push(group);
 
   const body = new THREE.Mesh(buildIslandGeometry(isl.r, isl.seed), islandMat);
+  body.userData = { islandGroup: group, islandR: isl.r };   // clickable: behold this isle
   group.add(body);
   occluders.push(body);
 
@@ -934,7 +1104,7 @@ for (const isl of ISLANDS){
     tmpColor.setHSL(0.105 + R()*0.035, RR(0.5, 0.66), RR(0.42, 0.52));
     grass.setColorAt(i, tmpColor);
   }
-  grass.frustumCulled = false;
+  grass.computeBoundingSphere(); grass.boundingSphere.radius += 2;   // sway margin; culls with the island
   group.add(grass);
 
   /* wildflowers */
@@ -951,7 +1121,7 @@ for (const isl of ISLANDS){
     flowers.setMatrixAt(i, dummy.matrix);
     flowers.setColorAt(i, flTints[(R()*3)|0]);
   }
-  flowers.frustumCulled = false;
+  flowers.computeBoundingSphere(); flowers.boundingSphere.radius += 2;
   group.add(flowers);
 
   /* flowering vines draped over the rim */
@@ -966,7 +1136,7 @@ for (const isl of ISLANDS){
     dummy.updateMatrix();
     vines.setMatrixAt(i, dummy.matrix);
   }
-  vines.frustumCulled = false;
+  vines.computeBoundingSphere(); vines.boundingSphere.radius += 2.5;   // vines sway furthest
   group.add(vines);
 
   /* soft white stones breaking through the meadow */
@@ -982,7 +1152,7 @@ for (const isl of ISLANDS){
     dummy.updateMatrix();
     rocks.setMatrixAt(i, dummy.matrix);
   }
-  rocks.frustumCulled = false;
+  rocks.computeBoundingSphere(); rocks.boundingSphere.radius += 1;
   group.add(rocks);
 
   /* crystals: hanging clusters beneath + a few sprouting on top */
@@ -1017,7 +1187,7 @@ for (const isl of ISLANDS){
     dummy.updateMatrix();
     crystals.setMatrixAt(i, dummy.matrix);
   });
-  crystals.frustumCulled = false;
+  crystals.computeBoundingSphere(); crystals.boundingSphere.radius += 2;
   group.add(crystals);
 
   /* one great tree */
@@ -1054,6 +1224,40 @@ for (const isl of ISLANDS){
     group.add(fall);
     const base = new THREE.Vector3(px + out.x*10, MIST_Y + 8 - isl.y, pz + out.z*10);
     group.add(makeEmbers(90, base, width*1.4));
+    /* impact coronas: slow rings of light spreading where the fall meets the mist */
+    {
+      const ringMat = new THREE.ShaderMaterial({
+        transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false,
+        uniforms: { uTime, uPhase: { value: R() } },
+        vertexShader: /* glsl */`
+          varying vec2 vUv;
+          void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+        `,
+        fragmentShader: /* glsl */`
+          varying vec2 vUv;
+          uniform float uTime, uPhase;
+          void main(){
+            vec2 q = vUv*2.0 - 1.0;
+            float r = length(q);
+            float a = 0.0;
+            for (int i = 0; i < 2; i++){
+              float ph = fract(uTime*0.21 + uPhase + float(i)*0.5);
+              float d = abs(r - ph*0.92);
+              a += smoothstep(0.10, 0.0, d) * (1.0 - ph) * (1.0 - ph);
+            }
+            a *= smoothstep(1.0, 0.85, r) * 0.18;   /* emit alpha once; quiet enough to read as glow on the mist, not a floating hoop */
+            gl_FragColor = vec4(vec3(1.0, 0.88, 0.62), a);
+          }
+        `
+      });
+      const ringGeo = new THREE.PlaneGeometry(width*3.2, width*3.2);
+      ringGeo.rotateX(-Math.PI/2);
+      const rings = new THREE.Mesh(ringGeo, ringMat);
+      rings.position.set(base.x, base.y + 1.5, base.z);
+      rings.renderOrder = 9;
+      rings.frustumCulled = false;
+      group.add(rings);
+    }
     fallInfos.push({ island: isl, angle: a, top: new THREE.Vector3(isl.x + px, isl.y + topY, isl.z + pz) });
   }
 }
@@ -1099,6 +1303,7 @@ function makeDriftClouds({ count, yMin, yMax, sMin, sMax, alpha, lantern, span, 
       attribute vec3 aPos; attribute vec4 aPar; attribute vec3 aTint; attribute float aSpd;
       uniform float uTime, uSpan;
       varying vec2 vUv; varying float vAlpha; varying float vDist; varying vec3 vTint;
+      varying vec3 vW; varying float vBack;
       void main(){
         vUv = uv; vTint = aTint;
         vec3 base = aPos;
@@ -1110,6 +1315,8 @@ function makeDriftClouds({ count, yMin, yMax, sMin, sMax, alpha, lantern, span, 
         vec3 right = vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
         vec3 up    = vec3(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
         vec3 wp = base + right*off.x + up*off.y;
+        vW = wp;
+        vBack = pow(max(dot(normalize(wp - cameraPosition), vec3(${SUN_DIR.x.toFixed(5)}, ${SUN_DIR.y.toFixed(5)}, ${SUN_DIR.z.toFixed(5)})), 0.0), 5.0);
         vec4 mv = viewMatrix * vec4(wp, 1.0);
         vDist = -mv.z;
         vAlpha = aPar.y * edgeFade;   /* no pop when a puff wraps around */
@@ -1120,12 +1327,16 @@ function makeDriftClouds({ count, yMin, yMax, sMin, sMax, alpha, lantern, span, 
       uniform sampler2D uTex;
       uniform vec3 uFogColor; uniform float uFogDensity;
       varying vec2 vUv; varying float vAlpha; varying float vDist; varying vec3 vTint;
+      varying vec3 vW; varying float vBack;
       ${GLSL_FOGF}
       void main(){
         vec4 t = texture2D(uTex, vUv);
         float ff = fogFactor(vDist, uFogDensity);
         vec3 col = vTint;
-        col = mix(col, uFogColor, ff*0.85);
+        /* backlit silver-gold lining — real cumulus at golden hour */
+        float rim = t.a * (1.0 - smoothstep(0.06, 0.35, t.a));
+        col += vec3(1.35, 0.95, 0.55) * vBack * rim * 2.0;
+        col = mix(col, fogTint(normalize(vW - cameraPosition), uFogColor), ff*0.85);
         float a = t.a * vAlpha * (1.0 - ff*0.55);
         if (a < 0.004) discard;
         gl_FragColor = vec4(col, a);
@@ -1141,8 +1352,11 @@ function makeDriftClouds({ count, yMin, yMax, sMin, sMax, alpha, lantern, span, 
 makeDriftClouds({ count: 46, yMin: 230, yMax: 420, sMin: 190, sMax: 430, alpha: 0.32, lantern: 0.22, span: 1500, zMin: -1700, zMax: 700, order: 5 });
 makeDriftClouds({ count: 40, yMin: -20, yMax: 130, sMin: 120, sMax: 300, alpha: 0.26, lantern: 0.16, span: 1300, zMin: -1500, zMax: 700, order: 5 });
 makeDriftClouds({ count: 48, yMin: -250, yMax: -140, sMin: 260, sMax: 640, alpha: 0.5, lantern: 0.12, span: 1500, zMin: -1700, zMax: 800, order: 4 });
-/* near-field layer draws after wisps/petals so they can't bleed through it */
-makeDriftClouds({ count: 22, yMin: -120, yMax: 40, sMin: 220, sMax: 520, alpha: 0.16, lantern: 0.1, span: 1600, zMin: -1200, zMax: 800, order: 8 });
+/* near-field veil draws after EVERYTHING it should soften — wisps/petals (7),
+   waterfalls (8), embers (9), motes/trails (10) — so hot particles can't
+   bleed through it; god rays (12) still shine over the top. order 8 tied
+   with the falls and the sort flipped per-frame as centers crossed: a pop */
+makeDriftClouds({ count: 22, yMin: -120, yMax: 40, sMin: 220, sMax: 520, alpha: 0.16, lantern: 0.1, span: 1600, zMin: -1200, zMax: 800, order: 11 });
 
 /* mist floor plane */
 const mistFloor = new THREE.Mesh(
@@ -1170,10 +1384,19 @@ const mistFloor = new THREE.Mesh(
         float n = fbm(p + vec2(uTime*0.012, uTime*0.007));
         float n2 = vnoise(p*4.6 - vec2(uTime*0.02, 0.0));   // cheaper than a second fbm
         vec3 col = mix(vec3(0.72, 0.42, 0.18), vec3(1.02, 0.82, 0.55), n);
+        /* a shimmering road of sun-glitter across the mist, toward the gate */
+        vec2 vd = vW.xz - cameraPosition.xz;
+        vec2 vrd = vd / max(length(vd), 1.0);
+        float road = pow(max(dot(vrd, vec2(0.0509, -0.9987)), 0.0), 24.0)
+                   * smoothstep(80.0, 300.0, length(vd));
+        col += vec3(1.1, 0.8, 0.5) * road * (0.3 + 0.5*n2);
+        /* vast slow cloud-shade drifting across the sea of light */
+        float shade = vnoise(vW.xz*0.0013 + uTime*vec2(0.006, 0.004));
+        col *= 0.80 + 0.30*smoothstep(0.3, 0.7, shade);
         float edge = 1.0 - smoothstep(0.28, 0.5, distance(vUv, vec2(0.5)));
         float a = (0.5 + 0.36*n + 0.2*n2) * edge;
         float ff = fogFactor(distance(cameraPosition, vW), uFogDensity);
-        col = mix(col, uFogColor, ff*0.9);
+        col = mix(col, fogTint(normalize(vW - cameraPosition), uFogColor), ff*0.9);
         a *= 1.0 - ff*0.35;
         gl_FragColor = vec4(col, a);
       }
@@ -1185,6 +1408,67 @@ mistFloor.position.y = MIST_Y;
 mistFloor.renderOrder = 3;
 mistFloor.frustumCulled = false;
 scene.add(mistFloor);
+
+/* ============================================================
+   7.5 Distant silhouette archipelago — soft shapes in the haze
+   framing the world; the gate corridor stays clear
+   ============================================================ */
+{
+  /* far isles as pre-blurred SPRITES: fog only recolors geometry — its rims
+     stay razor-sharp and read as pasted cutouts against the haze. A soft
+     texture is soft by construction. Each sprite is pre-tinted in JS with
+     the same directional fogTint math the shaders use for its bearing. */
+  const texFarIsle = canvasTex(128, (g, s) => {
+    g.clearRect(0, 0, s, s);
+    g.save();                                   /* soft meadow cap */
+    g.translate(s*0.5, s*0.46);
+    g.scale(1, 0.34);
+    let gr = g.createRadialGradient(0, 0, 0, 0, 0, s*0.44);
+    gr.addColorStop(0,    'rgba(255,255,255,0.95)');
+    gr.addColorStop(0.62, 'rgba(255,255,255,0.75)');
+    gr.addColorStop(1,    'rgba(255,255,255,0)');
+    g.fillStyle = gr;
+    g.beginPath(); g.arc(0, 0, s*0.44, 0, 7); g.fill();
+    g.restore();
+    g.save();                                   /* tapering underside */
+    g.translate(s*0.5, s*0.56);
+    g.scale(0.62, 1);
+    gr = g.createRadialGradient(0, 0, 0, 0, 0, s*0.34);
+    gr.addColorStop(0,    'rgba(255,255,255,0.85)');
+    gr.addColorStop(0.55, 'rgba(255,255,255,0.5)');
+    gr.addColorStop(1,    'rgba(255,255,255,0)');
+    g.fillStyle = gr;
+    g.beginPath(); g.arc(0, 0, s*0.34, 0, 7); g.fill();
+    g.restore();
+  });
+  const _mauve = new THREE.Color(0.68, 0.44, 0.28);
+  const _hot = new THREE.Color(1.05, 0.76, 0.46);
+  const fogTintJS = (dir) => {
+    const s = Math.max(dir.dot(SUN_DIR), 0);
+    const c = _mauve.clone().lerp(FOG_COLOR, 0.55 + 0.45*s);
+    const h = Math.pow(s, 6) * 0.35;
+    c.r += _hot.r*h; c.g += _hot.g*h; c.b += _hot.b*h;
+    return c;
+  };
+  for (let i = 0; i < 12; i++){
+    const a = (i / 12) * Math.PI * 2 + RR(-0.22, 0.22);
+    const dist = RR(2650, 3400);
+    const x = Math.sin(a) * dist, z = Math.cos(a) * dist;
+    if (z < -1300 && Math.abs(x) < 900) continue;   // never crowd the gate
+    const y = RR(-140, -20);
+    const dir3 = new THREE.Vector3(x, y, z).normalize();
+    const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: texFarIsle, transparent: true, depthWrite: false, fog: false,
+      color: fogTintJS(dir3).multiplyScalar(0.94),   // a breath darker than the haze behind it
+      opacity: RR(0.4, 0.6),
+    }));
+    sp.position.set(x, y, z);
+    const w = RR(420, 780);
+    sp.scale.set(w, w*0.62, 1);
+    sp.renderOrder = 2.5;   // behind the mist floor (3) and every cloud layer
+    scene.add(sp);
+  }
+}
 
 /* ============================================================
    8. The Source — colossal crystal gate far across the haze
@@ -1223,6 +1507,7 @@ function buildGate(){
   merged.computeVertexNormals();
   const gateMat = crystalShader(420, 1.5, 0.62);
   const mesh = new THREE.Mesh(merged, gateMat);
+  mesh.userData.isGate = true;   // clickable: begin the entry sequence
   group.add(mesh);
   occluders.push(mesh);
 
@@ -1242,6 +1527,44 @@ function buildGate(){
   portalCore.position.set(0, 50, 10);
   portalCore.scale.setScalar(170);
   group.add(portalCore);
+  group.userData.portal = portal;         // the entry sequence swells these
+  group.userData.portalCore = portalCore;
+
+  /* the pillar of light — the portal's radiance rising into the sky */
+  const pillarMat = new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false,
+    side: THREE.DoubleSide,
+    uniforms: { uTime },
+    vertexShader: /* glsl */`
+      varying vec2 vUv;
+      void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+    `,
+    fragmentShader: /* glsl */`
+      varying vec2 vUv;
+      uniform float uTime;
+      ${GLSL_NOISE}
+      void main(){
+        /* max() guards: GPU float error can push these a hair negative at the
+           quad edges, and pow(negative) is NaN — bloom then smears it into
+           huge black blocks. Never again. */
+        float ex = max(sin(vUv.x*3.14159), 0.0);
+        float flow = 0.75 + 0.25*fbm3o(vec2(vUv.x*3.0, vUv.y*6.0 - uTime*0.05));
+        /* emit alpha once — additive blending applies it to the color */
+        float a = pow(ex, 2.4) * pow(max(1.0 - vUv.y, 0.0), 1.6) * flow * 0.16;
+        gl_FragColor = vec4(vec3(1.0, 0.85, 0.6), a);
+      }
+    `
+  });
+  const pillarGeo = new THREE.PlaneGeometry(150, 1500);
+  pillarGeo.translate(0, 750, 0);
+  for (const ry of [0, Math.PI/2]){
+    const pl = new THREE.Mesh(pillarGeo, pillarMat);
+    pl.position.set(0, 60, 0);
+    pl.rotation.y = ry;
+    pl.renderOrder = 12;
+    pl.frustumCulled = false;
+    group.add(pl);
+  }
 
   scene.add(group);
   return group;
@@ -1315,6 +1638,7 @@ function makeDrifters({ count, tex, size, area, yTop, yFall, tint, spin, sway })
     color: tint, fog: true, opacity: 0.9
   });
   const mesh = new THREE.InstancedMesh(geo, mat, count);
+  mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);   // rewritten every frame
   mesh.frustumCulled = false;
   mesh.renderOrder = 7;
   const st = [];
@@ -1357,6 +1681,7 @@ const leafMesh = new THREE.InstancedMesh(
   new THREE.PlaneGeometry(2.1, 3.1),
   new THREE.MeshBasicMaterial({ map: texLeaf, transparent: true, depthWrite: false, side: THREE.DoubleSide, color: new THREE.Color(1.5, 1.25, 0.8) }),
   LEAF_N);
+leafMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
 leafMesh.frustumCulled = false;
 leafMesh.renderOrder = 7;
 scene.add(leafMesh);
@@ -1370,7 +1695,7 @@ const trailGeo = new THREE.BufferGeometry();
 const trailPos = new Float32Array(LEAF_N*TRAIL_N*3);
 const trailFade = new Float32Array(LEAF_N*TRAIL_N);
 for (let i = 0; i < LEAF_N; i++) for (let j = 0; j < TRAIL_N; j++) trailFade[i*TRAIL_N + j] = 1 - j/TRAIL_N;
-trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPos, 3));
+trailGeo.setAttribute('position', new THREE.BufferAttribute(trailPos, 3).setUsage(THREE.DynamicDrawUsage));
 trailGeo.setAttribute('aFade', new THREE.BufferAttribute(trailFade, 1));
 const trailPts = new THREE.Points(trailGeo, new THREE.ShaderMaterial({
   transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false,
@@ -1487,8 +1812,8 @@ const birdMat = new THREE.ShaderMaterial({
     void main(){
       float d = abs(dot(normalize(vN), uSunDir));
       vec3 col = vec3(1.15, 1.1, 1.0) * (0.72 + 0.55*d);
-      float ff = fogFactor(distance(cameraPosition, vW), uFogDensity);
-      col = mix(col, uFogColor, ff*0.85);
+      float ff = fogFactor2(distance(cameraPosition, vW), uFogDensity, vW.y);
+      col = mix(col, fogTint(normalize(vW - cameraPosition), uFogColor), ff*0.85);
       gl_FragColor = vec4(col, 1.0);
     }
   `
@@ -1501,6 +1826,7 @@ const FLOCKS = [
 const flockMeshes = [];
 for (const f of FLOCKS){
   const mesh = new THREE.InstancedMesh(birdGeo, birdMat, f.n);
+  mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);   // rewritten every frame
   mesh.frustumCulled = false;
   const phases = new Float32Array(f.n);
   const birds = [];
@@ -1552,30 +1878,74 @@ const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(innerW
 composer.addPass(new RenderPass(scene, camera));
 /* threshold 0.95: bloom hugs the genuinely hot things (sun, falls, portal)
    and stops grabbing sub-pixel meadow highlights, which reads as flicker */
-const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.65, 0.45, 0.95);
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.58, 0.45, 0.95);
 composer.addPass(bloom);
 const gradePass = new ShaderPass({
-  uniforms: { tDiffuse: { value: null } },
+  uniforms: {
+    tDiffuse: { value: null }, uFlash: { value: 0 }, uAspect: { value: innerWidth/innerHeight },
+    uSunScreen: { value: new THREE.Vector2(0.5, 0.5) }, uRayStrength: { value: 0 }, uTaps: { value: 20 },
+  },
   vertexShader: /* glsl */`
     varying vec2 vUv;
     void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
   `,
   fragmentShader: /* glsl */`
     uniform sampler2D tDiffuse;
+    uniform float uFlash;
+    uniform float uAspect;
+    uniform vec2 uSunScreen;
+    uniform float uRayStrength;
+    uniform float uTaps;
     varying vec2 vUv;
+    float hashG(vec2 p){ p = fract(p*vec2(123.34, 345.45)); p += dot(p, p+34.345); return fract(p.x*p.y); }
     void main(){
+      /* filmic grade, pre-tonemap (HDR linear in, ACES + sRGB applied later) */
       vec3 c = texture2D(tDiffuse, vUv).rgb;
+      /* screen-space crepuscular rays — a dithered march toward the sun,
+         born and killed by the same occlusion-smoothed flareVis the lens
+         flare trusts, so they can never flicker independently of it */
+      if (uRayStrength > 0.001){
+        vec2 sv = (uSunScreen - vUv) / uTaps;
+        vec2 pos = vUv + sv * hashG(gl_FragCoord.xy + 7.0);   /* dither start: banding becomes fine noise */
+        vec3 acc = vec3(0.0);
+        float wsum = 0.0, w = 1.0;
+        for (int i = 0; i < 24; i++){
+          if (float(i) >= uTaps) break;
+          vec3 s = texture2D(tDiffuse, pos).rgb;
+          float lum = dot(s, vec3(0.2126, 0.7152, 0.0722));
+          acc += s * smoothstep(0.55, 1.0, lum) * w;
+          wsum += w;
+          w *= 0.82;
+          pos += sv;
+        }
+        c += (acc / max(wsum, 1e-4)) * vec3(1.0, 0.78, 0.5) * uRayStrength;
+      }
       float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
-      c = mix(c, vec3(l), -0.10);                       /* gentle saturation lift */
-      c *= vec3(1.05, 0.98, 0.88);                      /* golden-white grade     */
+      /* vibrance — quiet pixels gain color, loud ones are left alone */
+      float sat = length(c - vec3(l)) / max(l, 1e-4);
+      c = mix(vec3(l), c, 1.0 + 0.14*(1.0 - smoothstep(0.0, 0.9, sat)));
+      /* split-tone about the luminance pivot: violet-rose shadows, champagne light */
+      float w = smoothstep(0.18, 0.85, l);
+      c *= mix(vec3(1.010, 0.965, 1.045), vec3(1.045, 1.005, 0.905), w);
+      c *= vec3(1.05, 0.99, 0.90);                             /* golden-white base   */
       c += vec3(0.020, 0.011, 0.003) * max(0.0, 1.0 - l*2.4);  /* gold in the shadows */
-      float d = distance(vUv, vec2(0.5));
-      c *= 0.8 + 0.24 * (1.0 - smoothstep(0.28, 0.78, d));   /* soft vignette */
+      /* highlight rolloff: the hottest light desaturates toward white —
+         it reads as radiance, not orange clip */
+      float hot = smoothstep(1.1, 3.2, l);
+      c = mix(c, vec3(max(l, 1.0)), hot*0.6);
+      /* aspect-true vignette — rational falloff, no corner crush */
+      vec2 q = (vUv - 0.5) * vec2(uAspect, 1.0);
+      float r2 = dot(q, q) / (0.25 * (uAspect*uAspect + 1.0));
+      c *= 0.82 + 0.22 / (1.0 + 2.6*r2*r2);
+      c = mix(c, vec3(1.0, 0.97, 0.9), uFlash);                /* portal white-out */
+      /* end-of-pass dither: none of the smooth gradients above may ever band */
+      c += (hashG(gl_FragCoord.xy) - 0.5) * 0.004;
       gl_FragColor = vec4(c, 1.0);
     }
   `
 });
 composer.addPass(gradePass);
+const gradeUniforms = gradePass.uniforms;   // ShaderPass clones the literal — hold the live copy
 composer.addPass(new OutputPass());
 
 /* ============================================================
@@ -1586,14 +1956,14 @@ const camPoints = [
   [  40, 150,  560], [ 330, 110,  330], [ 430,  70,  -40], [ 320,  40, -260],
   [ 150,  60,  -60], [  40,  46,   60], [ -25,  40,   -5], [ -45, -60,  -35],
   [ -60,-180,  -70], [ -20,-226, -170], [  90,-160, -200], [ 155,-112, -195],
-  [  90, -20, -320], [  60,  70, -650], [  30, 120,-1010], [-160, 170, -720],
+  [  90, -20, -320], [  60,  70, -650], [  75, 105,-1010], [-160, 170, -720],
   [-330, 130, -260], [-360,  90,  120], [-180, 120,  380],
 ].map(p => new THREE.Vector3(...p));
 const lookPoints = [
   [   0,  40, -200], [  50,  30,    0], [ 120,  10, -120], [ -50,  60, -250],
   [   0,  35,   40], [ -30,  30,   10], [ -40, -60,  -40], [ -55,-160,  -55],
   [ -40,-260, -160], [ 120,-180, -220], [ 185, -40, -170], [ 185, -30, -170],
-  [  60,  80, -900], [  60,  90,-1500], [  60, 110,-1500], [   0,  60, -150],
+  [  55,  75, -900], [  -5,  75,-1500], [  -5,  95,-1500], [   0,  60, -150],
   [-190,  55, -120], [-280,  20,   90], [   0,  30,   60],
 ].map(p => new THREE.Vector3(...p));
 const camCurve  = new THREE.CatmullRomCurve3(camPoints,  true, 'centripetal', 0.5);
@@ -1614,47 +1984,212 @@ function showHint(text){
   hintEl.classList.add('show');
   hintTimer = 6;
 }
-showHint('cinematic tour — press C to fly free');
+const TOUR_HINT = 'cinematic tour — C to fly free · click an isle to behold it · E to enter the gate · H for help';
+let FLY_HINT = 'free flight — click to look · WASD move · Space up · Q down · Shift fast · C to return';
+/* where the browser can tell us, name the keys as they appear on the user's
+   actual layout (the code reads physical positions, so WASD is wrong text
+   on AZERTY and friends) */
+if (navigator.keyboard && navigator.keyboard.getLayoutMap){
+  navigator.keyboard.getLayoutMap().then(map => {
+    const k = c => (map.get(c) || c.replace('Key', '')).toUpperCase();
+    FLY_HINT = `free flight — click to look · ${k('KeyW')}${k('KeyA')}${k('KeyS')}${k('KeyD')} move · Space up · ${k('KeyQ')} down · Shift fast · C to return`;
+  }).catch(() => {});
+}
+const REDUCED_MOTION = matchMedia('(prefers-reduced-motion: reduce)').matches;
+showHint(TOUR_HINT);
 
-addEventListener('keydown', (e) => {
-  if (e.code === 'KeyC' && !e.repeat){
-    fly.on = !fly.on;
-    if (fly.on){
-      fly.pos.copy(camera.position);
-      const e2 = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ');
-      fly.yaw = e2.y; fly.pitch = e2.x;
-      showHint('free flight — click to look · WASD move · Space up · Q down · Shift fast · C to return');
-    } else {
-      showHint('cinematic tour — press C to fly free');
-      if (document.pointerLockElement) document.exitPointerLock();
-      /* re-seed the tour gaze from the current view so resuming never snaps */
-      camera.getWorldDirection(_fwd);
-      lookSmooth.copy(camera.position).addScaledVector(_fwd, 120);
-    }
+function setFly(on){
+  if (fly.on === on) return;
+  fly.on = on;
+  if (on){
+    focus.island = null;
+    fly.pos.copy(camera.position);
+    const e2 = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ');
+    fly.yaw = e2.y; fly.pitch = e2.x;
+    showHint(FLY_HINT);
+  } else {
+    showHint(TOUR_HINT);
+    if (document.pointerLockElement) document.exitPointerLock();
+    /* re-seed the tour gaze from the current view so resuming never snaps */
+    camera.getWorldDirection(_fwd);
+    lookSmooth.copy(camera.position).addScaledVector(_fwd, 120);
   }
+}
+addEventListener('keydown', (e) => {
+  if (e.code === 'KeyC' && !e.repeat && !portalSeq.on) setFly(!fly.on);
+  if (e.code === 'KeyE' && !e.repeat && !portalSeq.on) startPortal();
+  if (e.code === 'KeyH' && !e.repeat) showHint(fly.on ? FLY_HINT : TOUR_HINT);
+  if (e.code === 'Escape' && portalSeq.on) abortPortal();
   fly.keys[e.code] = true;
 });
 addEventListener('keyup', (e) => { fly.keys[e.code] = false; });
 addEventListener('blur', () => { fly.keys = {}; });   // no stuck keys after alt-tab
+/* click-to-look must never fail silently: the browser refuses pointer lock
+   for ~1.25s after Esc and whenever the window lacks focus. Until the lock
+   lands, holding the button drags the view, so looking always works. */
+let dragLook = null;
 document.addEventListener('pointerlockchange', () => {
-  if (fly.on && !document.pointerLockElement) showHint('mouse released — click to look again · C to return to the tour');
+  if (document.pointerLockElement === renderer.domElement) dragLook = null;   // lock landed — no drag jump
+  else if (fly.on) showHint('mouse released — click to look again · C to return to the tour');
 });
-renderer.domElement.addEventListener('mousedown', () => {
-  if (fly.on && !document.pointerLockElement){
-    const p = renderer.domElement.requestPointerLock();
-    if (p && p.catch) p.catch(() => {});   // rejects inside the post-Esc cooldown
+document.addEventListener('pointerlockerror', () => {
+  if (fly.on) showHint('mouse capture blocked — drag to look, or click again in a moment');
+});
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0) return;
+  if (!fly.on){
+    /* on the tour: clicks reach into the world — isles and the gate answer */
+    if (!portalSeq.on) actOn(pickAt(e.clientX, e.clientY));
+    return;
+  }
+  if (!document.pointerLockElement){
+    dragLook = { x: e.clientX, y: e.clientY };
+    if (e.pointerType === 'mouse'){
+      const p = renderer.domElement.requestPointerLock();
+      if (p && p.catch) p.catch(() => showHint('mouse capture blocked — drag to look, or click again in a moment'));
+    }
   }
 });
-addEventListener('mousemove', (e) => {
-  if (fly.on && document.pointerLockElement === renderer.domElement){
+addEventListener('pointermove', (e) => {
+  if (!fly.on) return;
+  if (document.pointerLockElement === renderer.domElement){
     fly.yaw   -= e.movementX * 0.0021;
     fly.pitch -= e.movementY * 0.0021;
-    fly.pitch = Math.max(-1.5, Math.min(1.5, fly.pitch));
-  }
+  } else if (dragLook && e.buttons & 1){
+    fly.yaw   -= (e.clientX - dragLook.x) * 0.0035;
+    fly.pitch -= (e.clientY - dragLook.y) * 0.0035;
+    dragLook.x = e.clientX; dragLook.y = e.clientY;
+  } else return;
+  fly.pitch = Math.max(-1.5, Math.min(1.5, fly.pitch));
 });
+addEventListener('pointerup',     () => { dragLook = null; });
+addEventListener('pointercancel', () => { dragLook = null; });
+
+/* ---- beholding an isle & entering the Source ----------------- */
+const focus = { island: null, angle: 0 };
+const portalSeq = { on: false, s: 0, from: new THREE.Vector3() };
+const PORTAL_CENTER = GATE_POS.clone().add(new THREE.Vector3(0, 60, 0));
+const clickRay = new THREE.Raycaster();
+const _ndc = new THREE.Vector2();
+function pickAt(cx, cy){
+  _ndc.set((cx/innerWidth)*2 - 1, -(cy/innerHeight)*2 + 1);
+  clickRay.setFromCamera(_ndc, camera);
+  clickRay.far = 4000;
+  const hit = clickRay.intersectObjects(occluders, false)[0];
+  return hit ? hit.object : null;
+}
+function actOn(obj){
+  if (!obj){
+    if (focus.island){ focus.island = null; showHint(TOUR_HINT); }
+    return;
+  }
+  if (obj.userData.isGate) startPortal();
+  else if (obj.userData.islandGroup){
+    if (focus.island === obj){ focus.island = null; showHint(TOUR_HINT); }
+    else {
+      focus.island = obj;
+      const g = obj.userData.islandGroup;
+      /* begin the orbit from the camera's present bearing — no swing-around */
+      focus.angle = Math.atan2(camera.position.x - g.position.x, camera.position.z - g.position.z);
+      showHint('beholding the isle — click it again, or the open sky, to drift on');
+    }
+  }
+}
+function startPortal(){
+  if (portalSeq.on) return;
+  portalSeq.on = true;
+  portalSeq.s = 0;
+  portalSeq.from.copy(camera.position);
+  focus.island = null;
+  fly.on = false;
+  if (document.pointerLockElement) document.exitPointerLock();
+  showHint('the Source calls…');
+}
+function abortPortal(){
+  portalSeq.on = false;
+  gradeUniforms.uFlash.value = 0;
+  const pu = gate.userData;
+  pu.portal.material.opacity = 0.6;
+  pu.portalCore.material.opacity = 0.9;
+  pu.portalCore.scale.setScalar(170);
+  camSmooth.copy(camera.position);
+  showHint(TOUR_HINT);
+}
+const _pv = new THREE.Vector3(), _lv = new THREE.Vector3(), _p1 = new THREE.Vector3(), _p2 = new THREE.Vector3();
+function updatePortalSeq(dt){
+  portalSeq.s += dt / 9;                       // nine seconds from call to threshold
+  const s = Math.min(1, portalSeq.s);
+  const e = s*s*(3 - 2*s);
+  /* quadratic bezier: here → a high staging point before the arch → just past its heart */
+  _p1.set(PORTAL_CENTER.x, PORTAL_CENTER.y + 70, PORTAL_CENTER.z + 640);
+  _p2.set(PORTAL_CENTER.x, PORTAL_CENTER.y, PORTAL_CENTER.z - 40);
+  const a = 1 - e;
+  _pv.set(0, 0, 0)
+     .addScaledVector(portalSeq.from, a*a)
+     .addScaledVector(_p1, 2*a*e)
+     .addScaledVector(_p2, e*e);
+  camera.position.copy(_pv);
+  camSmooth.copy(_pv);
+  _lv.copy(PORTAL_CENTER); _lv.z -= 260;       // gaze through the light, not at it
+  camera.lookAt(_lv);
+  lookSmooth.copy(_lv);
+  /* the light rises to meet you */
+  const pu = gate.userData;
+  pu.portal.material.opacity = 0.6 + e*0.4;
+  pu.portalCore.material.opacity = Math.min(1, 0.9 + e*0.1);
+  pu.portalCore.scale.setScalar(170 * (1 + e*1.7));
+  gradeUniforms.uFlash.value = THREE.MathUtils.smoothstep(s, 0.84, 1.0);
+  if (portalSeq.s >= 1.16){
+    /* through the white — and the isles receive you again at the tour's dawn */
+    portalSeq.on = false;
+    gradeUniforms.uFlash.value = 1;            // eases back to the world in the main loop
+    pu.portal.material.opacity = 0.6;
+    pu.portalCore.material.opacity = 0.9;
+    pu.portalCore.scale.setScalar(170);
+    window.__heaven.setTour(0.001);
+    showHint('…and the isles receive you again');
+  }
+}
+
+/* ---- PS5 DualSense / any standard-mapping gamepad ------------- */
+const pad = { move: new THREE.Vector3(), fast: false };
+let padIndex = null;
+const padPrev = {};
+addEventListener('gamepadconnected', (e) => {
+  padIndex = e.gamepad.index;
+  showHint('controller — sticks fly · ✕ behold / enter · ◯ tour · R2 rise · L2 sink · R1 fast');
+});
+addEventListener('gamepaddisconnected', (e) => { if (e.gamepad.index === padIndex) padIndex = null; });
+const stickDz = v => Math.abs(v) < 0.13 ? 0 : (v - Math.sign(v)*0.13)/0.87;
+function pollPad(dt){
+  if (padIndex === null || portalSeq.on) return;
+  const gp = navigator.getGamepads && navigator.getGamepads()[padIndex];
+  if (!gp) return;
+  const lx = stickDz(gp.axes[0] || 0), ly = stickDz(gp.axes[1] || 0);
+  const rx = stickDz(gp.axes[2] || 0), ry = stickDz(gp.axes[3] || 0);
+  const pressed = i => !!(gp.buttons[i] && gp.buttons[i].pressed);
+  const edge = i => { const now = pressed(i), was = padPrev[i]; padPrev[i] = now; return now && !was; };
+  /* stick motion wakes free flight from the tour */
+  if (!fly.on && !focus.island && (lx || ly || rx || ry)) setFly(true);
+  if (fly.on){
+    /* squared response: precise near center, swift at the rim */
+    fly.yaw   -= rx*Math.abs(rx) * 2.6 * dt;
+    fly.pitch -= ry*Math.abs(ry) * 1.9 * dt;
+    fly.pitch = Math.max(-1.5, Math.min(1.5, fly.pitch));
+    pad.move.set(lx, (gp.buttons[7] ? gp.buttons[7].value : 0) - (gp.buttons[6] ? gp.buttons[6].value : 0), ly);
+    pad.fast = pressed(5);
+  } else {
+    pad.move.set(0, 0, 0);
+    pad.fast = false;
+  }
+  if (edge(0)) actOn(pickAt(innerWidth/2, innerHeight/2));       // ✕ — behold what you face
+  if (edge(1)){ if (fly.on) setFly(false); else if (focus.island){ focus.island = null; showHint(TOUR_HINT); } }  // ◯ — back to the tour
+  if (edge(9)) setFly(!fly.on);                                  // Options — toggle flight
+}
 
 const _fwd = new THREE.Vector3(), _rgt = new THREE.Vector3(), _mv = new THREE.Vector3();
 function updateCamera(t, dt){
+  if (portalSeq.on){ updatePortalSeq(dt); return; }
   if (fly.on){
     camera.rotation.set(fly.pitch, fly.yaw, 0, 'YXZ');
     _fwd.set(-Math.sin(fly.yaw)*Math.cos(fly.pitch), Math.sin(fly.pitch), -Math.cos(fly.yaw)*Math.cos(fly.pitch));
@@ -1666,20 +2201,49 @@ function updateCamera(t, dt){
     if (fly.keys['KeyA']) _mv.sub(_rgt);
     if (fly.keys['Space']) _mv.y += 1;
     if (fly.keys['KeyQ']) _mv.y -= 1;
-    const speed = (fly.keys['ShiftLeft'] || fly.keys['ShiftRight']) ? 160 : 55;
-    if (_mv.lengthSq() > 0) fly.pos.addScaledVector(_mv.normalize(), speed*dt);
+    if (pad.move.lengthSq() > 0){
+      /* analog: forward is stick-up (negative y-axis), magnitude preserved */
+      _mv.addScaledVector(_fwd, -pad.move.z);
+      _mv.addScaledVector(_rgt, pad.move.x);
+      _mv.y += pad.move.y;
+    }
+    const speed = (fly.keys['ShiftLeft'] || fly.keys['ShiftRight'] || pad.fast) ? 160 : 55;
+    if (_mv.lengthSq() > 0){
+      if (_mv.lengthSq() > 1) _mv.normalize();   // keyboard diagonals cap at 1; analog keeps its finesse
+      fly.pos.addScaledVector(_mv, speed*dt);
+    }
     camera.position.copy(fly.pos);
     camSmooth.copy(camera.position);
     return;
   }
-  tour.t = (tour.t + dt / TOUR_SECONDS) % 1;
+  if (focus.island){
+    /* glide into a slow orbit around the chosen isle, gaze on its heart */
+    const g = focus.island.userData.islandGroup;
+    const r = focus.island.userData.islandR;
+    focus.angle += dt*0.07;
+    const d = r*2.6 + 26;
+    _pv.set(g.position.x + Math.sin(focus.angle)*d,
+            g.position.y + r*0.75 + 14,
+            g.position.z + Math.cos(focus.angle)*d);
+    _lv.set(g.position.x, g.position.y + r*0.18, g.position.z);
+    const kp = 1 - Math.exp(-dt*1.6);
+    const kl = 1 - Math.exp(-dt*2.2);
+    camSmooth.lerp(_pv, kp);
+    lookSmooth.lerp(_lv, kl);
+    camera.position.copy(camSmooth);
+    camera.lookAt(lookSmooth);
+    return;
+  }
+  tour.t = (tour.t + dt / (REDUCED_MOTION ? TOUR_SECONDS*2 : TOUR_SECONDS)) % 1;
   const p = camCurve.getPointAt(tour.t);
   /* keep the gaze in lockstep with the camera's control points: convert the
      arc-length parameter into segment space and sample the look curve there */
   const seg = camCurve.getUtoTmapping(tour.t, 0);
   const l = lookCurve.getPoint((seg + 0.002) % 1);
-  /* gentle handheld sway */
-  p.x += Math.sin(t*0.31)*1.4; p.y += Math.sin(t*0.23)*1.0; p.z += Math.cos(t*0.27)*1.4;
+  if (!REDUCED_MOTION){
+    /* gentle handheld sway */
+    p.x += Math.sin(t*0.31)*1.4; p.y += Math.sin(t*0.23)*1.0; p.z += Math.cos(t*0.27)*1.4;
+  }
   const kp = 1 - Math.exp(-dt*3.2);
   const kl = 1 - Math.exp(-dt*2.4);
   camSmooth.lerp(p, kp);
@@ -1696,6 +2260,7 @@ if (qp.has('t')){
 }
 window.__heaven = {
   ready: false,
+  scene, gate, camera, renderer,   // debug/QA hooks
   info: () => ({ calls: renderer.info.render.calls, tris: renderer.info.render.triangles,
                  geoms: renderer.info.memory.geometries, progs: renderer.info.programs.length }),
   setTour(tt){
@@ -1715,14 +2280,26 @@ if (qp.has('t')) window.__heaven.setTour(tour.t);
 const clock = new THREE.Clock();
 let emaMs = 16;
 let qTimer = 0;
-let bestMs = 1000;   // fastest observed frame ≈ the display's refresh interval
+let bestMs = 1000;     // decaying estimate of the display's refresh interval
+let winMin = 1000;     // fastest raw frame in the current evaluation window
+let calmWindows = 0;   // consecutive windows with clear headroom
+const levelCooldown = new Array(QUALITY.length).fill(0);   // windows before a level that just failed may be retried
+let shaderTime = 0;
+document.addEventListener('visibilitychange', () => {
+  /* wrap the shader clock while nobody is looking — float32 jitters at large
+     values, but wrapping mid-view would visibly snap every shader animation */
+  if (document.hidden && shaderTime > 600) shaderTime %= 600;
+});
 
 function setPixelLevel(lv){
   pixelLevel = lv;
-  if (lv === PIXEL_STEPS.length - 1){
-    /* final step: drop MSAA too — dispose forces reallocation without samples */
+  const q = QUALITY[lv];
+  gradeUniforms.uTaps.value = [24, 24, 20, 12, 0][lv] || 0;   // crepuscular ray budget per rung
+  if (composer.renderTarget1.samples !== q.msaa){
+    /* sample-count changes need reallocation — dispose and the next frame
+       rebuilds the targets with the new setting (works in both directions) */
     for (const rt of [composer.renderTarget1, composer.renderTarget2]){
-      rt.samples = 0;
+      rt.samples = q.msaa;
       rt.dispose();
     }
   }
@@ -1731,11 +2308,13 @@ function setPixelLevel(lv){
 function onResize(){
   camera.aspect = innerWidth/innerHeight;
   camera.updateProjectionMatrix();
-  const pr = Math.min(devicePixelRatio, PIXEL_STEPS[pixelLevel]);
+  /* absolute scale, capped so a huge window cannot allocate absurd targets */
+  const pr = Math.min(QUALITY[pixelLevel].px, 3840 / Math.max(innerWidth, innerHeight));
   renderer.setPixelRatio(pr);
   composer.setPixelRatio(pr);
   renderer.setSize(innerWidth, innerHeight);
   composer.setSize(innerWidth, innerHeight);
+  gradeUniforms.uAspect.value = innerWidth/innerHeight;
   emberUniformsShared.uPx.value = (innerHeight * pr) / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov*0.5)));
 }
 addEventListener('resize', onResize);
@@ -1744,11 +2323,14 @@ onResize();
 let frames = 0;
 function animate(){
   requestAnimationFrame(animate);
-  const dt = Math.min(0.05, clock.getDelta());
+  const dtRaw = clock.getDelta();
+  const dt = Math.min(0.05, dtRaw);   // clamped for simulation; metrics use the real value
   const t = clock.elapsedTime;
-  /* wrapped shader clock: raw elapsed time quantizes in float32 after hours
-     of runtime and shader motion turns stuttery */
-  uTime.value = t % 3600;
+  /* continuous shader clock: accumulates while visible (float32-safe for
+     hours) and wraps only while the tab is hidden — never a visible snap */
+  shaderTime += dt;
+  if (shaderTime > 14400) shaderTime %= 600;   // backstop after ~4h of truly continuous viewing
+  uTime.value = shaderTime;
 
   /* islands bob and turn very slowly, resting on the light */
   for (const g of islandGroups){
@@ -1762,29 +2344,58 @@ function animate(){
   feathers.update(t);
   petals.update(t);
   updateLeaves(t, dt);
+  pollPad(dt);
   updateCamera(t, dt);
   camera.updateMatrixWorld();
   updateFlare(dt);
+  /* after the portal: the world eases back in from the white */
+  if (!portalSeq.on && gradeUniforms.uFlash.value > 0){
+    gradeUniforms.uFlash.value = Math.max(0, gradeUniforms.uFlash.value - dt*0.5);
+  }
 
   /* hint fade */
   if (hintTimer > 0){ hintTimer -= dt; if (hintTimer <= 0) hintEl.classList.remove('show'); }
 
   composer.render();
 
-  /* adaptive quality: step down if frames run well over the display's own
-     refresh interval (an absolute cutoff would wrongly degrade forever on
-     30Hz screens or battery-throttled rAF) */
-  if (frames > 30) bestMs = Math.min(bestMs, dt*1000);
-  emaMs = emaMs*0.96 + dt*1000*0.04;
+  /* adaptive quality, two-way: measured from UNclamped frame times (the
+     physics clamp used to hide how slow frames really were, so the ladder
+     could never fire on the machines it was built for). Down when frames
+     sag well past the display's refresh; up again after sustained headroom,
+     with a cooldown so a level that just failed is not retried at once. */
+  const ms = dtRaw*1000;
+  if (frames > 30 && ms < 500){   // ignore tab-restore / debugger-pause spikes
+    winMin = Math.min(winMin, Math.max(2, ms));
+    emaMs = emaMs*0.96 + ms*0.04;
+  }
   qTimer += dt;
-  if (qTimer > 4){
+  if (qTimer > 4 && frames > 30){
     qTimer = 0;
-    if (emaMs > Math.max(21, bestMs*1.35) && pixelLevel < PIXEL_STEPS.length - 1) setPixelLevel(pixelLevel + 1);
+    /* slow upward decay: under sustained GPU-bound load winMin is merely the
+       fastest SLOW frame, and a fast decay let bestMs re-baseline until ~30ms
+       frames read as headroom and the ladder climbed while still slow */
+    bestMs = Math.min(bestMs*1.06 + 0.2, winMin);
+    winMin = 1000;
+    for (let i = 0; i < levelCooldown.length; i++) if (levelCooldown[i] > 0) levelCooldown[i]--;
+    if (emaMs > Math.max(21, bestMs*1.45) && pixelLevel < QUALITY.length - 1){
+      setPixelLevel(pixelLevel + 1);
+      levelCooldown[pixelLevel - 1] = 8;   // the level that just failed waits ~8 windows
+      calmWindows = 0;
+    } else if (emaMs < Math.max(17, bestMs*1.15) && emaMs < 18.5 && pixelLevel > 0 && levelCooldown[pixelLevel - 1] === 0){
+      /* the absolute 18.5ms gate means sub-60Hz displays never probe upward —
+         deliberate: on them the refresh estimate drifts under load, and a
+         stable rung beats a 45s quality oscillation */
+      if (++calmWindows >= 2){ calmWindows = 0; setPixelLevel(pixelLevel - 1); }
+    } else {
+      calmWindows = 0;
+    }
   }
 
   frames++;
   if (frames === 2){
     window.__heaven.ready = true;
+    clearTimeout(window.__loadWatchdog);
+    document.getElementById('loader').classList.add('hide');
     document.getElementById('title').classList.add('show');
     setTimeout(() => document.getElementById('title').classList.remove('show'), 7000);
   }
